@@ -20,7 +20,6 @@ mod lan_sync;
 mod sync_transfer;
 mod platforms;
 mod proxy;
-mod version_check;
 use platforms::common::{
     BilibiliDanmakuState, DouyinDanmakuState, FollowHttpClient, HuyaDanmakuState, TwitchDanmakuState,
 };
@@ -467,14 +466,12 @@ fn main() {
                 platforms::bilibili::search::search_bilibili_rooms,
                 platforms::huya::search::search_huya_anchors,
                 open_in_default_browser,
-                version_check::check_version_cmd,
                 platforms::twitch::api::fetch_twitch_categories,
                 platforms::twitch::api::fetch_twitch_live_list,
                 platforms::twitch::api::get_twitch_stream_cmd,
                 platforms::twitch::api::get_twitch_streamer_status,
                 platforms::twitch::danmaku::start_twitch_danmaku_listener,
                 platforms::twitch::danmaku::stop_twitch_danmaku_listener,
-                version_check::download_and_install_cmd,
             ])
             .build(tauri::generate_context!())
             .expect("error while building tauri application")

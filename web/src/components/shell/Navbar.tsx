@@ -2,10 +2,10 @@
 
 import React, { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { AnimatePresence, m } from "framer-motion";
-import { ChevronDown, ExternalLink, LayoutGrid, MonitorSmartphone, Moon, Search, Settings, Sun, X } from "lucide-react";
+import { ChevronDown, LayoutGrid, MonitorSmartphone, Moon, Search, Settings, Sun, X } from "lucide-react";
 import { usePathname } from "next/navigation";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { getVersion } from "@tauri-apps/api/app";
 
 import styles from "./Navbar.module.css";
 import { LanSyncModal } from "./LanSyncModal";
@@ -21,18 +21,6 @@ import { useAppSettings } from "@/state/settings/SettingsProvider";
 import { SettingsModal } from "@/components/settings/SettingsModal";
 
 type UiPlatform = "douyu" | "douyin" | "huya" | "bilibili" | "twitch" | "custom";
-
-type VersionInfo = {
-  version: string;
-  title?: string;
-  notes?: string[];
-  url?: string;
-  published_at?: string;
-  /** 安装包字节数，用于让 Rust 侧判断本地是否已下载完整安装包 */
-  size?: number;
-};
-
-const GITHUB_RELEASES_URL = "https://github.com/cookie-kangd/dtv_x/releases";
 
 const basePlatforms: Array<{ id: Exclude<UiPlatform, "custom">; name: string }> = [
   { id: "douyu", name: "斗鱼" },
@@ -113,56 +101,7 @@ export function Navbar({
 
   const [updateOpen, setUpdateOpen] = useState(false);
   const [lanSyncOpen, setLanSyncOpen] = useState(false);
-  const [versionInfo, setVersionInfo] = useState<VersionInfo | null>(null);
-  const [hasUpdate, setHasUpdate] = useState(false);
   const [localVersion, setLocalVersion] = useState<string>("");
-  const [updatePhase, setUpdatePhase] = useState<"idle" | "downloading" | "installing" | "launched" | "error">("idle");
-  const [updatePercent, setUpdatePercent] = useState<number>(0);
-  const [updateMsg, setUpdateMsg] = useState<string>("");
-  const [isCheckingUpdate, setIsCheckingUpdate] = useState(false);
-
-  // 应用内更新：下载进度事件（Rust 侧 download_and_install_cmd 发出）
-  useEffect(() => {
-    const un = listen<{
-      // launched = 安装向导已启动且本应用仍存活（正常安装路径），按钮需恢复可点
-      phase: "downloading" | "installing" | "launched" | "error";
-      percent: number;
-      message?: string;
-    }>("update-progress", (e) => {
-      const p = e.payload;
-      if (!p?.phase) return;
-      setUpdatePhase(p.phase);
-      if (typeof p.percent === "number") setUpdatePercent(p.percent);
-      setUpdateMsg(p.message || "");
-    });
-    return () => {
-      void un.then((f) => f()).catch(() => {});
-    };
-  }, []);
-
-  const startUpdate = useCallback(async () => {
-    if (!versionInfo?.url || updatePhase === "downloading" || updatePhase === "installing") return;
-    setUpdatePhase("downloading");
-    setUpdatePercent(0);
-    setUpdateMsg("正在连接下载源…");
-    try {
-      // Rust 侧行为：本地已有完整安装包 → 跳过下载直接进入安装；
-      // 否则下载完成后关闭文件句柄 → 直接启动 NSIS 安装向导（不经 cmd，
-      // 因此不会闪黑窗）。已安装时由安装器自己关闭 DTV_X，本应用保持存活。
-      await invoke("download_and_install_cmd", {
-        url: versionInfo.url,
-        version: versionInfo.version,
-        size: versionInfo.size ?? null
-      });
-      // 兜底：正常情况下 Rust 的 update-progress 事件已经把状态改对了，
-      // 这里只处理事件因退出而丢失的情况。
-      setUpdatePhase((prev) => (prev === "downloading" ? "launched" : prev));
-      setUpdateMsg((prev) => prev || "安装向导已启动，请按提示完成安装");
-    } catch (err) {
-      setUpdatePhase("error");
-      setUpdateMsg(typeof err === "string" ? err : String(err));
-    }
-  }, [versionInfo, updatePhase]);
 
   const playerUi = usePlayerUi();
   const playerOverlay = usePlayerOverlay();
@@ -244,55 +183,24 @@ export function Navbar({
     });
   }, []);
 
-  // 请求序号：手动打开弹窗触发的检查若先返回，不会被更早的慢响应覆盖
-  const versionCheckSeqRef = useRef(0);
-
-  /** 主动检查一次更新（挂载时 + 每次打开版本弹窗时都会调用） */
-  const checkUpdate = useCallback(async () => {
-    const seq = ++versionCheckSeqRef.current;
-    setIsCheckingUpdate(true);
-    try {
-      // 版本检查不是关键功能：失败不重试、不报错、不提示
-      const res = await invoke<any>("check_version_cmd");
-      if (seq !== versionCheckSeqRef.current) return; // 已过期，丢弃
-      const local = typeof res?.local_version === "string" ? res.local_version : "";
-      setLocalVersion(local);
-      const remote = res?.remote;
-      if (remote && typeof remote.version === "string" && remote.version.trim()) {
-        const info: VersionInfo = {
-          version: remote.version,
-          title: typeof remote.title === "string" ? remote.title : undefined,
-          notes: Array.isArray(remote.notes) ? remote.notes.filter((x: any) => typeof x === "string") : undefined,
-          url: typeof remote.url === "string" ? remote.url : undefined,
-          published_at: typeof remote.published_at === "string" ? remote.published_at : undefined,
-          size: typeof remote.size === "number" ? remote.size : undefined
-        };
-        setVersionInfo(info);
+  // 只读取安装程序的本地版本，不再连接上游更新源。
+  useEffect(() => {
+    let active = true;
+    const loadLocalVersion = async () => {
+      try {
+        const version = await getVersion();
+        if (active) setLocalVersion(version);
+      } catch {
+        // 读取失败时保留版本占位符。
       }
-      setHasUpdate(!!res?.has_update);
-    } catch {
-      // ignore
-    } finally {
-      if (seq === versionCheckSeqRef.current) setIsCheckingUpdate(false);
-    }
+    };
+    void loadLocalVersion();
+    return () => { active = false; };
   }, []);
 
-  // 启动时检查一次（用于标题栏的 NEW 徽标）
-  useEffect(() => {
-    void checkUpdate();
-  }, [checkUpdate]);
-
-  /** 点击版本按钮：打开弹窗，并每次都主动检查一次更新 */
   const openUpdateModal = useCallback(() => {
     setUpdateOpen(true);
-    if (updatePhase === "error") {
-      // 上次更新失败：清掉错误提示，重新进入可点击状态（安装包会被复用，不会重新下载）
-      setUpdatePhase("idle");
-      setUpdateMsg("");
-      setUpdatePercent(0);
-    }
-    void checkUpdate();
-  }, [checkUpdate, updatePhase]);
+  }, []);
 
   const searchPlatform: SearchPlatform | null = useMemo(() => {
     if (activePlatform === "bilibili") return "bilibili";
@@ -529,45 +437,6 @@ export function Navbar({
     const r = el.getBoundingClientRect();
     setHighlight({ width: r.width, x: r.left - c.left, opacity: 1 });
   }, [activePlatform]);
-
-  const openExternal = useCallback(async (url: string) => {
-    const raw = String(url || "").trim();
-    if (!raw) return;
-
-    const normalizedUrl = (() => {
-      try {
-        return new URL(raw).toString();
-      } catch {
-        // allow passing github.com/xxx
-        try {
-          return new URL(`https://${raw}`).toString();
-        } catch {
-          return raw;
-        }
-      }
-    })();
-
-    try {
-      await invoke("open_in_default_browser", { url: normalizedUrl });
-      return;
-    } catch {
-      // ignore
-    }
-    try {
-      const opener: any = await import("@tauri-apps/plugin-opener");
-      if (typeof opener?.open === "function") {
-        await opener.open(normalizedUrl);
-        return;
-      }
-    } catch {
-      // ignore
-    }
-    try {
-      window.open(normalizedUrl, "_blank", "noopener,noreferrer");
-    } catch {
-      // ignore
-    }
-  }, []);
 
   useLayoutEffect(() => {
     updateHighlight();
@@ -895,7 +764,6 @@ export function Navbar({
           onClick={openUpdateModal}
         >
           <span className={styles.versionText}>v{localVersion || "?"}</span>
-          {hasUpdate ? <span className={styles.badgeNew}>NEW</span> : null}
         </button>
 
         <button
@@ -970,11 +838,7 @@ export function Navbar({
             >
               <div className={styles.overlayHeader}>
                 <div className={styles.overlayTitle}>
-                  {hasUpdate && versionInfo
-                    ? versionInfo.title || `发现新版本 v${versionInfo.version}`
-                    : isCheckingUpdate
-                      ? "正在检查更新…"
-                      : "版本信息"}
+                  版本信息
                 </div>
                 <button type="button" className={styles.overlayClose} onClick={() => setUpdateOpen(false)} aria-label="关闭">
                   <X size={16} />
@@ -983,78 +847,12 @@ export function Navbar({
               <div className={styles.overlayBody}>
                 <div className={styles.updateMeta}>
                   <span>当前版本：v{localVersion || "?"}</span>
-                  {hasUpdate && versionInfo ? (
-                    <span>最新版本：v{versionInfo.version}</span>
-                  ) : isCheckingUpdate ? (
-                    <span>正在检查更新…</span>
-                  ) : (
-                    <span>已是最新</span>
-                  )}
-                  {hasUpdate && versionInfo?.published_at ? <span>发布日期：{versionInfo.published_at}</span> : null}
+                  <span>更新源已断开</span>
                 </div>
-                {hasUpdate && versionInfo?.notes?.length ? (
-                  <ul className={styles.updateNotes}>
-                    {versionInfo.notes.map((n, idx) => (
-                      <li key={`${idx}-${n}`}>{n}</li>
-                    ))}
-                  </ul>
-                ) : null}
-
-                {updatePhase === "downloading" || updatePhase === "installing" || updatePhase === "launched" ? (
-                  <div className={styles.updateProgressWrap}>
-                    <div className={styles.updateProgressTrack}>
-                      <div
-                        className={styles.updateProgressBar}
-                        style={{ width: `${Math.min(100, Math.max(2, updatePercent))}%` }}
-                      />
-                    </div>
-                    <div className={styles.updateProgressText}>
-                      {updatePhase === "downloading"
-                        ? `正在下载更新 ${updatePercent.toFixed(1)}%`
-                        : updateMsg || "安装向导已启动，请按提示完成安装"}
-                    </div>
-                  </div>
-                ) : null}
-                {updatePhase === "error" ? <div className={styles.updateErrorText}>{updateMsg || "更新失败，请稍后重试或前往下载页"}</div> : null}
-
                 <div className={styles.updateActions}>
-                  {hasUpdate && versionInfo ? (
-                    <>
-                      <button
-                        type="button"
-                        className={styles.primaryBtn}
-                        disabled={updatePhase === "downloading" || updatePhase === "installing"}
-                        onClick={() => void startUpdate()}
-                      >
-                        {updatePhase === "downloading"
-                          ? "正在下载…"
-                          : updatePhase === "installing"
-                            ? "正在退出并启动安装…"
-                            : updatePhase === "error"
-                              ? "重试更新"
-                              : updatePhase === "launched"
-                                ? "再次启动安装向导"
-                                : "立即更新"}
-                      </button>
-                      <button
-                        type="button"
-                        className={styles.secondaryBtn}
-                        onClick={() => void openExternal((versionInfo?.url || GITHUB_RELEASES_URL) as string)}
-                      >
-                        <ExternalLink size={14} />
-                        打开下载页
-                      </button>
-                    </>
-                  ) : (
-                    <button
-                      type="button"
-                      className={styles.primaryBtn}
-                      onClick={() => void openExternal((versionInfo?.url || GITHUB_RELEASES_URL) as string)}
-                    >
-                      <ExternalLink size={16} />
-                      打开 GitHub
-                    </button>
-                  )}
+                  <button type="button" className={styles.primaryBtn} onClick={() => setUpdateOpen(false)}>
+                    关闭
+                  </button>
                 </div>
               </div>
             </m.div>

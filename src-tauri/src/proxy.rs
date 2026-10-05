@@ -10,6 +10,11 @@ use std::sync::OnceLock;
 use std::time::Duration;
 use tauri::{AppHandle, State};
 
+#[path = "live_http.rs"]
+mod live_http;
+
+struct LiveHttpClient(Client);
+
 /// 本进程已启动的静态图片代理 base URL（如 `http://127.0.0.1:34721`）。
 ///
 /// 存在的意义：静态代理的幂等判断**必须**基于「本进程是否启动过它」，
@@ -144,7 +149,7 @@ async fn image_proxy_handler(
 async fn flv_proxy_handler(
     _req: HttpRequest,
     stream_url_store: web::Data<StreamUrlStore>,
-    client: web::Data<Client>,
+    client: web::Data<LiveHttpClient>,
 ) -> impl Responder {
     let url = stream_url_store.url.lock().unwrap().clone();
     if url.is_empty() {
@@ -156,7 +161,7 @@ async fn flv_proxy_handler(
         url
     );
 
-    let mut req = client
+    let mut req = client.0
         .get(&url)
         .header("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         .header("Accept", "video/x-flv,application/octet-stream,*/*")
@@ -455,6 +460,7 @@ pub async fn start_proxy(
                 .build()
                 .expect("failed to build client"),
         );
+        let app_data_live_client = web::Data::new(LiveHttpClient(live_http::live_client()));
         // 走系统代理的客户端（Twitch 等海外平台回源用）
         let app_data_system_client = web::Data::new(SystemProxyHttpClient(
             Client::builder()
@@ -468,6 +474,7 @@ pub async fn start_proxy(
         App::new()
             .app_data(app_data_stream_url)
             .app_data(app_data_reqwest_client)
+            .app_data(app_data_live_client)
             .app_data(app_data_system_client)
             .wrap(actix_cors::Cors::permissive())
             .route("/live.flv", web::get().to(flv_proxy_handler))
@@ -567,6 +574,7 @@ pub async fn start_static_proxy_server(
                 .build()
                 .expect("failed to build client"),
         );
+        let app_data_live_client = web::Data::new(LiveHttpClient(live_http::live_client()));
         // 走系统代理的客户端（Twitch 等海外平台回源用）
         let app_data_system_client = web::Data::new(SystemProxyHttpClient(
             Client::builder()
@@ -580,6 +588,7 @@ pub async fn start_static_proxy_server(
         App::new()
             .app_data(app_data_stream_url)
             .app_data(app_data_reqwest_client)
+            .app_data(app_data_live_client)
             .app_data(app_data_system_client)
             .wrap(actix_cors::Cors::permissive())
             .route("/live.flv", web::get().to(flv_proxy_handler))

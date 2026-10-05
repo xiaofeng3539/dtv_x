@@ -15,7 +15,7 @@ export interface DouyinRustDanmakuPayload {
   fans_club_level: number; // from Rust's i32
 }
 
-export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality: string = '原画'): Promise<{ 
+export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality: string = '原画', candidateIndex: number = 0): Promise<{
   streamUrl: string | null;
   streamType: string | undefined; 
   title?: string | null; 
@@ -25,6 +25,7 @@ export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality:
   normalizedRoomId?: string | null;
   webRid?: string | null;
   initialError: string | null; // Made non-optional, will always be string or null
+  candidateCount?: number;
 }> {
   if (!roomId) {
     return {
@@ -55,7 +56,7 @@ export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality:
       const errorMsg = (result.error_message || '').trim();
       if (errorMsg) {
         console.error(`[DouyinPlayerHelper] Error from backend for room ${roomId}: ${errorMsg}`);
-        const definitelyOffline = errorMsg.includes('未开播') || errorMsg.includes('不存在') || result.status !== 2;
+        const definitelyOffline = errorMsg.includes('未开播') || errorMsg.includes('房间不存在');
         if (definitelyOffline || attempt >= MAX_ATTEMPTS) {
           return {
             streamUrl: null,
@@ -77,7 +78,7 @@ export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality:
       const rawStreamUrl = result.stream_url ?? null;
 
       // 未开播：不重试
-      if (result.status !== 2) {
+      if (result.status != null && result.status !== 2) {
         return {
           streamUrl: null,
           streamType: undefined,
@@ -110,20 +111,10 @@ export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality:
         continue;
       }
 
-      const sanitizedStreamUrl = enforceHttps(rawStreamUrl);
-      let streamType: string | undefined = undefined;
-
-      if (rawStreamUrl.startsWith('http://127.0.0.1') && rawStreamUrl.endsWith('/live.flv')) {
-        streamType = 'flv';
-      } else if (rawStreamUrl.includes('pull-hls') || rawStreamUrl.endsWith('.m3u8')) {
-        console.warn(`[DouyinPlayerHelper] Received HLS-like stream URL (${rawStreamUrl}), but expected flv. Overriding to flv.`);
-        streamType = 'flv';
-      } else if (rawStreamUrl.includes('pull-flv') || rawStreamUrl.includes('.flv')) {
-        streamType = 'flv';
-      } else {
-        console.warn(`[DouyinPlayerHelper] Could not determine stream type for URL: ${rawStreamUrl}. Defaulting to flv.`);
-        streamType = 'flv';
-      }
+      const candidates = result.available_streams?.filter((stream) => !!stream.url) || [];
+      const selected = candidates.length ? candidates[candidateIndex % candidates.length] : undefined;
+      const sanitizedStreamUrl = selected?.url || rawStreamUrl;
+      const streamType = selected?.format === 'hls' || sanitizedStreamUrl.includes('.m3u8') ? 'hls' : 'flv';
 
       return {
         streamUrl: sanitizedStreamUrl,
@@ -135,6 +126,7 @@ export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality:
         normalizedRoomId: result.normalized_room_id ?? null,
         webRid: result.web_rid ?? null,
         initialError: null,
+        candidateCount: candidates.length || 1,
       };
     } catch (e: any) {
       console.error(`[DouyinPlayerHelper] Exception while fetching Douyin stream details for ${roomId} (attempt ${attempt}/${MAX_ATTEMPTS}):`, e);
@@ -148,7 +140,7 @@ export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality:
           isLive: false,
           normalizedRoomId: null,
           webRid: null,
-          initialError: e?.message || '获取直播信息失败: 未知错误',
+          initialError: String(e?.message || e || '获取直播信息失败: 未知错误'),
         };
       }
       await new Promise((resolve) => setTimeout(resolve, 450));
@@ -171,8 +163,11 @@ export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality:
 function normalizeDouyinQuality(input: string): string {
   const upper = input.trim().toUpperCase();
   if (upper === 'OD' || upper === '原画') return 'OD';
-  if (upper === 'BD' || upper === '标清') return 'BD';
-  if (upper === 'UHD' || upper === '高清') return 'UHD';
+  if (upper === 'BD' || upper === '蓝光') return 'BD';
+  if (upper === 'UHD' || upper === '超清') return 'UHD';
+  if (upper === 'HD' || upper === '高清') return 'HD';
+  if (upper === 'SD' || upper === '标清') return 'SD';
+  if (upper === 'LD' || upper === '流畅') return 'LD';
   return 'OD';
 }
 
@@ -245,17 +240,4 @@ export async function stopDouyinDanmaku(currentUnlistenFn: (() => void) | null):
   } catch (error) {
     console.error('[DouyinPlayerHelper] Error stopping Douyin danmaku listener:', error);
   }
-}
-
-function enforceHttps(url: string): string {
-  if (!url) {
-    return url;
-  }
-  if (url.startsWith('https://')) {
-    return url;
-  }
-  if (url.startsWith('http://')) {
-    return `https://${url.slice('http://'.length)}`;
-  }
-  return url;
 }

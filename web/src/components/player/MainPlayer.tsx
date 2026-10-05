@@ -351,6 +351,7 @@ export function MainPlayer({
   // ===== 自动重连运行时状态（全部用 ref，避免定时器闭包读到陈旧值）=====
   const reconnectAttemptRef = useRef(0);
   const reconnectTimerRef = useRef<number | null>(null);
+  const playbackFailureTimerRef = useRef<number | null>(null);
   // 取流期间被守卫挡下的重连请求（不再丢弃，等本次取流结束后补偿调度）
   const reconnectDeferredRef = useRef(false);
   // 已经用尽重连次数、把控制权交还用户：此时停止一切自动重连，直到用户手动重载
@@ -451,6 +452,8 @@ export function MainPlayer({
     typeof window === "undefined" ? null : resolveStoredLine(platform, lineOptionsByPlatform[platform] ?? [])
   );
   const currentQualityRef = useRef(currentQuality);
+  const streamCandidateIndexRef = useRef(0);
+  const streamCandidateCountRef = useRef(1);
   const currentLineRef = useRef(currentLine);
   const lineOptionsRef = useRef<LineOption[]>(lineOptions);
   currentQualityRef.current = currentQuality;
@@ -1202,6 +1205,10 @@ export function MainPlayer({
 
 
   const destroyPlayer = useCallback(() => {
+    if (playbackFailureTimerRef.current !== null) {
+      window.clearTimeout(playbackFailureTimerRef.current);
+      playbackFailureTimerRef.current = null;
+    }
     // 切房间/切画质/销毁时，停掉挂起的自动重连定时器，
     // 避免旧会话的定时器在新会话里误触发一次重连。
     // 注意一：这里刻意不重置 reconnectAttemptRef —— 自动重连内部也会经过 destroyPlayer，
@@ -1739,13 +1746,18 @@ export function MainPlayer({
             return;
           }
           console.warn("[Player] 播放错误事件，准备自动重连:", err);
-          // 延后一拍再调度，尽量避开 reloadStream 的 in-flight 窗口。
-          // 即便仍然撞上窗口也不会丢：scheduleReconnect 会转为「补偿调度」，
-          // 由该次 reloadStream 的 finally 补上（旧实现是静默丢弃，重连链条会当场断裂）。
-          window.setTimeout(() => {
-            if (!isSessionActive(sessionId)) return;
+          // 同一故障只观察一次；内核已恢复画面时，不再重启健康连接。
+          if (playbackFailureTimerRef.current !== null) return;
+          const video = playerRef.current?.root?.querySelector("video") as HTMLVideoElement | null;
+          const position = video?.currentTime ?? 0;
+          playbackFailureTimerRef.current = window.setTimeout(() => {
+            playbackFailureTimerRef.current = null;
+            if (!isSessionActive(sessionId) || userPausedRef.current) return;
+            const current = playerRef.current?.root?.querySelector("video") as HTMLVideoElement | null;
+            if (current && !current.ended && !current.error &&
+                (current.currentTime > position || (!current.paused && current.readyState >= 3))) return;
             scheduleReconnect(String(detail));
-          }, 0);
+          }, 3000);
         });
         // 收到 playing：这次故障已结束，立刻回满重连预算并开启免打扰期。
         // 旧实现在这里只记起始时刻、要等「连续稳定 15 秒」才回血，而直播流的播放头
@@ -1937,6 +1949,8 @@ export function MainPlayer({
       // 非自动重连（切房间/切画质/用户点刷新）视为「重新开始」：重置退避与所有重连相关状态；
       // 自动重连必须保留计数，否则永远到不了上限、会无限重试拖垮自己和服务器。
       if (!opts?.isAutoReconnect) {
+        streamCandidateIndexRef.current = 0;
+        streamCandidateCountRef.current = 1;
         autoReconnectModeRef.current = false;
         reconnectAttemptRef.current = 0;
         reconnectBlockedRef.current = false;
@@ -1952,6 +1966,9 @@ export function MainPlayer({
         userPausedRef.current = false;
         clearReconnectTimer();
         setReconnectNotice(null);
+      } else {
+        // 刷新凭据后尝试下一条同画质线路，不持续重试失效的 CDN。
+        streamCandidateIndexRef.current = (streamCandidateIndexRef.current + 1) % streamCandidateCountRef.current;
       }
 
       setIsLoadingStream(true);
@@ -2014,15 +2031,15 @@ export function MainPlayer({
 
         if (platform === Platform.DOUYU) {
           const resolvedLine = resolveCurrentLineFor(lineOptions, effectiveLine);
-          try {
-            const info = await invoke<any>("fetch_douyu_room_info", { roomId });
+          void invoke<any>("fetch_douyu_room_info", { roomId }).then((info) => {
+            if (!isSessionActive(sessionId)) return;
             setPlayerTitle(info?.room_name ?? null);
             setPlayerAnchorName(info?.nickname ?? null);
             setPlayerAvatar(info?.avatar_url ?? null);
-          } catch {
-            // ignore meta fetch failures
-          }
-          const { streamUrl, streamType } = await getDouyuStreamConfig(roomId, effectiveQuality, resolvedLine);
+          }).catch(() => {});
+          const { streamUrl, streamType } = await getDouyuStreamConfig(
+            roomId, effectiveQuality, resolvedLine, opts?.isAutoReconnect ? reconnectAttemptRef.current : 0
+          );
           if (!isSessionActive(sessionId)) return;
           setPlayerIsLive(true);
           const nextIsHls = (streamType || "").toLowerCase() === "hls" || streamUrl.toLowerCase().includes(".m3u8");
@@ -2051,13 +2068,14 @@ export function MainPlayer({
             await mountPlayer(sessionId, streamUrl, streamType);
           }
         } else if (platform === Platform.DOUYIN) {
-          const resp = await fetchAndPrepareDouyinStreamConfig(roomId, effectiveQuality);
+          const resp = await fetchAndPrepareDouyinStreamConfig(roomId, effectiveQuality, streamCandidateIndexRef.current);
           if (!isSessionActive(sessionId)) return;
+          streamCandidateCountRef.current = resp.candidateCount || 1;
           setPlayerTitle(resp.title ?? null);
           setPlayerAnchorName(resp.anchorName ?? null);
           setPlayerAvatar(resp.avatar ?? null);
           setPlayerIsLive(resp.isLive);
-          if (!resp.streamUrl) throw new Error(resp.initialError || "主播未开播或无法获取直播流");
+          if (!resp.streamUrl) throw new Error(resp.initialError || "抖音直播流获取失败");
           // Douyin backend expects web_rid/live_id to bootstrap cookies, but emitted danmaku payload uses real room_id.
           const danmakuBackendRoomId = resp.webRid || roomId;
           const danmakuFilterRoomId = resp.normalizedRoomId || roomId;
@@ -2088,12 +2106,14 @@ export function MainPlayer({
           }
         } else if (platform === Platform.HUYA) {
           const resolvedLine = resolveCurrentLineFor(lineOptions, effectiveLine);
-          const { streamUrl, streamType, title, anchorName, avatar, isLive } = await getHuyaStreamConfig(
+          const { streamUrl, streamType, title, anchorName, avatar, isLive, candidateCount } = await getHuyaStreamConfig(
             roomId,
             effectiveQuality,
-            resolvedLine
+            resolvedLine,
+            streamCandidateIndexRef.current
           );
           if (!isSessionActive(sessionId)) return;
+          streamCandidateCountRef.current = candidateCount;
           setPlayerTitle(title ?? null);
           setPlayerAnchorName(anchorName ?? null);
           setPlayerAvatar(avatar ?? null);
@@ -2125,17 +2145,16 @@ export function MainPlayer({
           }
         } else if (platform === Platform.BILIBILI) {
           const cookie = typeof localStorage !== "undefined" ? localStorage.getItem("bilibili_cookie") : null;
-          try {
-            const payload = { platform, args: { room_id_str: roomId } };
-            const info = await invoke<any>("fetch_bilibili_streamer_info", { payload, cookie: cookie || null });
+          const payload = { platform, args: { room_id_str: roomId } };
+          void invoke<any>("fetch_bilibili_streamer_info", { payload, cookie: cookie || null }).then((info) => {
+            if (!isSessionActive(sessionId)) return;
             setPlayerTitle(info?.title ?? null);
             setPlayerAnchorName(info?.anchor_name ?? null);
             setPlayerAvatar(info?.avatar ?? null);
-          } catch {
-            // ignore meta fetch failures
-          }
-          const { streamUrl, streamType } = await getBilibiliStreamConfig(roomId, effectiveQuality, cookie || undefined);
+          }).catch(() => {});
+          const { streamUrl, streamType, candidateCount } = await getBilibiliStreamConfig(roomId, effectiveQuality, cookie || undefined, streamCandidateIndexRef.current);
           if (!isSessionActive(sessionId)) return;
+          streamCandidateCountRef.current = candidateCount;
           setPlayerIsLive(true);
           const nextIsHls = (streamType || "").toLowerCase() === "hls" || streamUrl.toLowerCase().includes(".m3u8");
           const nextKind: "hls" | "flv" = nextIsHls ? "hls" : "flv";

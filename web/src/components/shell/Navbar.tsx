@@ -10,6 +10,7 @@ import { listen } from "@tauri-apps/api/event";
 import styles from "./Navbar.module.css";
 import { LanSyncModal } from "./LanSyncModal";
 import { searchAnchors, type SearchAnchorResult, type SearchPlatform } from "@/services/search";
+import { parseLiveRoomUrl } from "@/services/liveRoomUrl";
 import { usePlayerUi } from "@/state/playerUi/PlayerUiProvider";
 import { useFollow, type Platform as FollowPlatform } from "@/state/follow/FollowProvider";
 import { Platform } from "@/platforms/common/types";
@@ -304,6 +305,24 @@ export function Navbar({
     return "搜索主播/房间";
   }, []);
 
+  const submitSearch = useCallback(() => {
+    const trimmed = searchQuery.trim();
+    if (!trimmed) return;
+    const target = parseLiveRoomUrl(trimmed);
+    if (target) {
+      navigateToPlayer(target.platform, target.roomId);
+      setSearchQuery("");
+      setSearchResults([]);
+      setSearchError(null);
+      setIsSearchFocused(false);
+      searchInputRef.current?.blur();
+    } else if (/^\d+$/.test(trimmed)) {
+      navigateToPlayer(activePlatform, trimmed);
+    } else if (/^https?:\/\//i.test(trimmed)) {
+      setSearchError("未识别到直播间，请粘贴斗鱼、虎牙、抖音或 B站的直播间链接");
+    }
+  }, [activePlatform, navigateToPlayer, searchQuery]);
+
   // 搜索结果开播状态校正缓存：key = platform:roomId，避免重复请求
   const liveStatusCacheRef = useRef<Map<string, boolean>>(new Map());
 
@@ -367,7 +386,7 @@ export function Navbar({
   useEffect(() => {
     const trimmed = searchQuery.trim();
     setSearchError(null);
-    if (!trimmed || !searchPlatform) {
+    if (!trimmed || !searchPlatform || /^https?:\/\//i.test(trimmed)) {
       setSearchResults([]);
       setIsLoadingSearch(false);
       return;
@@ -725,6 +744,7 @@ export function Navbar({
                 window.setTimeout(() => setPlayerSearchOpen(false), 80);
               }}
               onKeyDown={(e) => {
+                if (e.nativeEvent.isComposing) return;
                 if (e.key === "Escape") {
                   if (!isPlayerRoute) return;
                   setSearchQuery("");
@@ -735,11 +755,8 @@ export function Navbar({
                   return;
                 }
                 if (e.key !== "Enter") return;
-                const trimmed = searchQuery.trim();
-                if (!trimmed) return;
-                if (/^\d+$/.test(trimmed)) {
-                  navigateToPlayer(activePlatform, trimmed);
-                }
+                e.preventDefault();
+                submitSearch();
               }}
             />
             {searchQuery ? (
@@ -762,13 +779,7 @@ export function Navbar({
               className={styles.searchIconBtn}
               aria-label="搜索"
               onMouseDown={(e) => e.preventDefault()}
-              onClick={() => {
-                const trimmed = searchQuery.trim();
-                if (!trimmed) return;
-                if (/^\d+$/.test(trimmed)) {
-                  navigateToPlayer(activePlatform, trimmed);
-                }
-              }}
+              onClick={submitSearch}
             >
               <Search size={15} />
             </button>

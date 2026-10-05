@@ -1292,6 +1292,27 @@ export function MainPlayer({
     );
   }, []);
 
+  // 同步参考项目的 D/F 控制，复用现有弹幕状态和播放器全屏按钮。
+  useEffect(() => {
+    const handlePlayerShortcut = (event: KeyboardEvent) => {
+      if (event.isComposing || event.repeat || event.ctrlKey || event.altKey || event.metaKey) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest?.('input, textarea, select, [contenteditable]:not([contenteditable="false"]), [role="textbox"]')) return;
+      const player = playerRef.current;
+      if (!player) return;
+      const key = event.key.toLowerCase();
+      if (key === "d") {
+        event.preventDefault();
+        setIsDanmuEnabled((enabled) => !enabled);
+      } else if (key === "f" && player.plugins?.fullscreen?.toggleFullScreen) {
+        event.preventDefault();
+        player.plugins.fullscreen.toggleFullScreen();
+      }
+    };
+    document.addEventListener("keydown", handlePlayerShortcut);
+    return () => document.removeEventListener("keydown", handlePlayerShortcut);
+  }, []);
+
   // 记录「真实用户操作」的时刻，供 player.on("pause") 区分
   // 用户主动暂停 与 系统/内核自动暂停（详见该处的注释）。
   // 用捕获阶段监听：xgplayer 自己的控件可能会 stopPropagation，

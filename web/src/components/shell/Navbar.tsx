@@ -353,7 +353,7 @@ export function Navbar({
               // 与关注列表一致：show_status===1 即开播，仅 video_loop===1（轮播）视为未开播
               live = showStatus === 1 && loop !== 1;
             } else if (item.platform === "huya") {
-              const info = await invoke<any>("get_huya_unified_cmd", { roomId: item.roomId, quality: null, line: null });
+              const info = await invoke<any>("get_huya_unified_cmd", { roomId: item.roomId, quality: null, line: null, metadataOnly: true });
               live = !!info?.is_live;
             } else if (item.platform === "bilibili") {
               const payload = { platform: "BILIBILI", args: { room_id_str: item.roomId } };

@@ -11,5 +11,7 @@
 - `simple_live_core/lib/src/huya_site.dart`
 - `simple_live_core/lib/src/douyin_site.dart`
 - `simple_live_app/lib/modules/search/search_room_url.dart`
+- `simple_live_app/lib/services/follow_service.dart`（关注刷新并发与平台交错调度）
+- `simple_live_app/lib/modules/live_room/player/player_controls.dart`（D/F 播放快捷键）
 
 本次移植产生的派生实现按 GPL-3.0 提供；分发包含这些实现的修改版本时，应保留相关许可和版权声明，并提供对应源码。本修改版本包含 GPL-3.0 实现，不能将原项目的 MIT 声明理解为对新增派生实现的重新许可。

@@ -14,7 +14,9 @@ import { useAppSettings } from "@/state/settings/SettingsProvider";
 import { useImageProxy } from "@/hooks/useImageProxy";
 import { usePlayerOverlay } from "@/state/playerOverlay/PlayerOverlayProvider";
 
-const FOLLOW_REFRESH_CONCURRENCY = 2;
+// 参考 dart_simple_live 的 follow_service.dart：按 CPU 核心数自动分配 4–20 个查询。
+const FOLLOW_REFRESH_CONCURRENCY = () => Math.min(20, Math.max(4,
+  Math.round((typeof navigator === "undefined" ? 2 : navigator.hardwareConcurrency || 2) * 2.5)));
 const REFRESH_INITIAL_DELAY_MS = 1500;
 const DRAG_PREP_DELAY_MS = 150;
 const DRAG_MIN_PX = 8;
@@ -85,7 +87,7 @@ async function refreshOne(streamer: FollowedStreamer) {
 
   if (streamer.platform === "HUYA") {
     try {
-      const info = await invokeWithTimeout<any>("get_huya_unified_cmd", { roomId: streamer.id, quality: null, line: null });
+      const info = await invokeWithTimeout<any>("get_huya_unified_cmd", { roomId: streamer.id, quality: null, line: null, metadataOnly: true });
       return {
         nickname: info?.nick ?? streamer.nickname,
         avatarUrl: info?.avatar ?? streamer.avatarUrl,
@@ -140,6 +142,21 @@ async function refreshOne(streamer: FollowedStreamer) {
   }
 
   return {} satisfies Partial<FollowedStreamer>;
+}
+
+// 平台交错查询，避免列表开头的同一平台占满所有工作线程；保留平台内顺序。
+function interleaveByPlatform(streamers: FollowedStreamer[]) {
+  const groups = new Map<FollowPlatform, FollowedStreamer[]>();
+  for (const streamer of streamers) {
+    const group = groups.get(streamer.platform) ?? [];
+    group.push(streamer);
+    groups.set(streamer.platform, group);
+  }
+  const queue: FollowedStreamer[] = [];
+  for (let index = 0; queue.length < streamers.length; index++) {
+    for (const group of groups.values()) if (index < group.length) queue.push(group[index]);
+  }
+  return queue;
 }
 
 export function FollowsList() {
@@ -290,6 +307,8 @@ export function FollowsList() {
     if (isRefreshingRef.current) return;
     const streamers = follow.followedStreamers;
     if (streamers.length === 0) return;
+    const queue = interleaveByPlatform(streamers);
+    const concurrency = FOLLOW_REFRESH_CONCURRENCY();
     const updatedByKey = new Map<string, FollowedStreamer>(streamers.map((s) => [`${s.platform}:${s.id}`, s]));
     isRefreshingRef.current = true;
     setIsRefreshing(true);
@@ -302,41 +321,52 @@ export function FollowsList() {
     // 开头那行「if (isRefreshingRef.current) return;」无声挡下——
     // 表现就是「自动刷新好像失效了，点刷新也没反应」。
     // （与 v0.2.5 修的播放器 reloadInFlightRef 泄漏是同一类问题）
-    // 上限按本轮实际主播数推算：每个主播最长 20s、并发 2，再留 15s 余量。
-    const totalCap = Math.ceil(streamers.length / FOLLOW_REFRESH_CONCURRENCY) * REFRESH_ONE_TIMEOUT_MS + 15_000;
+    // 上限按本轮实际主播数和并发数推算，再留 15s 余量。
+    const totalCap = Math.ceil(streamers.length / concurrency) * REFRESH_ONE_TIMEOUT_MS + 15_000;
+    let expired = false;
+    const isCurrent = () => aliveRef.current && !expired;
     const releaseLock = () => {
       isRefreshingRef.current = false;
     };
-    const watchdog = window.setTimeout(releaseLock, totalCap);
+    const watchdog = window.setTimeout(() => {
+      expired = true;
+      releaseLock();
+      if (aliveRef.current) setIsRefreshing(false);
+    }, totalCap);
+    let patchTimer: number | null = null;
+    const pendingPatches: Array<{ platform: FollowedStreamer["platform"]; id: string; patch: Partial<FollowedStreamer> }> = [];
+    const flushPatches = () => {
+      if (patchTimer !== null) window.clearTimeout(patchTimer);
+      patchTimer = null;
+      if (isCurrent() && pendingPatches.length) follow.updateStreamers(pendingPatches.splice(0));
+    };
 
     try {
-      const concurrency = FOLLOW_REFRESH_CONCURRENCY;
       let idx = 0;
-      // 先全部收集到 pendingPatches，再统一批量写回：避免每个主播刷新完成都触发一次
-      // state 更新（N 个主播 = N 次重渲染），批量提交后只更新一次。
-      const pendingPatches: Array<{ platform: FollowedStreamer["platform"]; id: string; patch: Partial<FollowedStreamer> }> = [];
+      // 每 100ms 批量写回已完成结果，不等待慢房间，也避免每条结果触发一次重渲染。
       const workers = Array.from({ length: Math.min(concurrency, streamers.length) }, async () => {
-        while (idx < streamers.length) {
-          const current = streamers[idx];
+        while (isCurrent() && idx < queue.length) {
+          const current = queue[idx];
           idx += 1;
           try {
             const patch = await refreshOne(current);
+            if (!isCurrent()) return;
             pendingPatches.push({ platform: current.platform, id: current.id, patch });
             updatedByKey.set(`${current.platform}:${current.id}`, { ...current, ...patch });
+            if (patchTimer === null) patchTimer = window.setTimeout(flushPatches, 100);
           } catch {
             // 刷新失败时保持原状态不动：之前把 LIVE 降级为 UNKNOWN 会导致网络抖动时
             // 状态在绿/灰之间乱跳（用户感知为"状态没同步/不同步"）。
             void 0;
           } finally {
-            setProgressCurrent((v) => v + 1);
+            if (isCurrent()) setProgressCurrent((v) => v + 1);
           }
         }
       });
       await Promise.all(workers);
 
-      if (pendingPatches.length) {
-        follow.updateStreamers(pendingPatches);
-      }
+      flushPatches();
+      if (!isCurrent()) return;
 
       // 对齐老项目：刷新完成后，把“直播中”的主播优先展示（保留同一状态桶内的原相对顺序）
       const baseOrder = listItemsRef.current;
@@ -359,11 +389,12 @@ export function FollowsList() {
       follow.updateListOrder([...folderItems, ...liveItems, ...restItems]);
     } finally {
       window.clearTimeout(watchdog);
-      releaseLock();
-      if (aliveRef.current) {
+      if (patchTimer !== null) window.clearTimeout(patchTimer);
+      if (!expired) releaseLock();
+      if (isCurrent()) {
         setIsRefreshing(false);
         setShowCheckIcon(true);
-        window.setTimeout(() => setShowCheckIcon(false), 1000);
+        window.setTimeout(() => { if (aliveRef.current) setShowCheckIcon(false); }, 1000);
       }
     }
   }, [follow]);
@@ -384,7 +415,7 @@ export function FollowsList() {
   }, [refreshList]);
 
   // 定时轮询：setTimeout 链（同一时刻最多一个挂起定时器，不堆积）；
-  // 复用 refreshList（并发 2、逐个更新）。
+  // 复用 refreshList 的并发查询和批量更新。
   // 注意：不能依赖 document.visibilityState 判断——Tauri 窗口未聚焦/被遮挡时
   // WebView2 会把它报成 "hidden"，会导致轮询整轮被跳过（表现为"轮询没生效"）。
   // 这里只检查窗口是否真的被隐藏（minimize），窗口存在就照常刷新。

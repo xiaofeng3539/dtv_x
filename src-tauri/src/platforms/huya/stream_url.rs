@@ -722,6 +722,23 @@ fn extract_room_detail(profile: &Value) -> RoomDetail {
     }
 }
 
+// 关注列表和搜索只需要房间元信息，不执行播放线路解析或 WUP 鉴权。
+fn extract_room_metadata(profile: &Value) -> Result<HuyaUnifiedResponse, String> {
+    validate_profile_room(profile)?;
+    let detail = extract_room_detail(profile);
+    Ok(HuyaUnifiedResponse {
+        title: detail.title,
+        nick: detail.nick,
+        avatar: detail.avatar180,
+        introduction: None,
+        profileRoom: None,
+        is_live: detail.status,
+        flv_tx_urls: Vec::new(),
+        selected_url: None,
+        candidate_urls: Vec::new(),
+    })
+}
+
 fn extract_stream_candidates(profile: &Value) -> Result<Vec<WebStreamCandidate>, String> {
     validate_profile_room(profile)?;
     if profile_room_is_offline(profile) {
@@ -1032,6 +1049,7 @@ pub async fn get_huya_unified_cmd(
     room_id: String,
     quality: Option<String>,
     line: Option<String>,
+    metadata_only: Option<bool>,
     follow_http: State<'_, FollowHttpClient>,
 ) -> Result<HuyaUnifiedResponse, String> {
     let client = &follow_http.0.inner;
@@ -1039,6 +1057,9 @@ pub async fn get_huya_unified_cmd(
     let profile = fetch_profile_room(client, &room_id)
         .await
         .map_err(|e| e.to_string())?;
+    if metadata_only.unwrap_or(false) {
+        return extract_room_metadata(&profile);
+    }
     let detail = extract_room_detail(&profile);
     let candidates = extract_stream_candidates(&profile)?;
     if candidates.is_empty() && !profile_room_is_offline(&profile) {
@@ -1064,17 +1085,7 @@ pub async fn get_huya_unified_cmd(
     let selected_index = match selection {
         Some((_, idx)) => idx,
         None => {
-            return Ok(HuyaUnifiedResponse {
-                title: detail.title.clone(),
-                nick: detail.nick.clone(),
-                avatar: detail.avatar180.clone(),
-                introduction: None,
-                profileRoom: None,
-                is_live: detail.status || web_stream.is_live,
-                flv_tx_urls: Vec::new(),
-                selected_url: None,
-                candidate_urls: Vec::new(),
-            });
+            return extract_room_metadata(&profile);
         }
     };
 
@@ -1126,6 +1137,34 @@ const HEARTBEAT_BASE64: &str = "ABQdAAwsNgBM"; // same as Python
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn room_metadata_does_not_require_playback_authentication() {
+        let profile = serde_json::json!({
+            "status": 200,
+            "data": {"liveStatus": "ON", "stream": {},
+                "profileInfo": {"nick": "主播", "avatar180": "头像"},
+                "liveData": {"introduction": "标题"}}
+        });
+        let metadata = extract_room_metadata(&profile).unwrap();
+        assert!(metadata.is_live);
+        assert_eq!(metadata.nick.as_deref(), Some("主播"));
+        assert_eq!(metadata.avatar.as_deref(), Some("头像"));
+        assert_eq!(metadata.title.as_deref(), Some("标题"));
+        assert!(metadata.candidate_urls.is_empty());
+        assert!(metadata.selected_url.is_none());
+        assert!(metadata.flv_tx_urls.is_empty());
+        assert!(extract_stream_candidates(&profile).unwrap().is_empty());
+    }
+
+    #[test]
+    fn room_metadata_preserves_offline_and_rejects_invalid_responses() {
+        let offline = serde_json::json!({"status": 200, "data": {"liveStatus": "OFF"}});
+        assert!(!extract_room_metadata(&offline).unwrap().is_live);
+        for profile in [serde_json::json!({"status": 503}), serde_json::json!({"status": 200, "data": {}})] {
+            assert!(extract_room_metadata(&profile).is_err());
+        }
+    }
 
     #[test]
     fn unavailable_profile_is_an_error_instead_of_an_offline_room() {

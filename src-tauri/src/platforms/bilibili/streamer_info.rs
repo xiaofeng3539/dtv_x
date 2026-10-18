@@ -95,7 +95,7 @@ fn build_wbi_sign(room_id: &str, img_key: &str, sub_key: &str) -> (String, Strin
     let query = query_parts.join("&");
     let mut hasher = Md5::new();
     hasher.update(format!("{}{}", query, mixin_key).as_bytes());
-    let w_rid = format!("{:x}", hasher.finalize());
+    let w_rid = hex::encode(hasher.finalize());
     (wts, w_rid)
 }
 
@@ -118,6 +118,9 @@ pub async fn fetch_bilibili_streamer_info(
             available_streams: None,
             normalized_room_id: None,
             web_rid: None,
+            category_name: None,
+            category_id: None,
+            popularity: None,
         });
     }
 
@@ -173,6 +176,9 @@ pub async fn fetch_bilibili_streamer_info(
             available_streams: None,
             normalized_room_id: None,
             web_rid: None,
+            category_name: None,
+            category_id: None,
+            popularity: None,
         });
     }
     let j: Value = serde_json::from_str(&text)
@@ -187,6 +193,21 @@ pub async fn fetch_bilibili_streamer_info(
     let avatar = base_info["face"].as_str().map(|s| s.to_string());
     let live_status = room_info["live_status"].as_i64().unwrap_or(0) as i32;
 
+    // 分类只来自本响应：具体分区优先，其次 area，最后父分区；热度用 watched_show/online。
+    let online = room_info
+        .get("online")
+        .cloned()
+        .or_else(|| data.pointer("/watched_show/num").cloned());
+    let metadata = crate::platforms::common::follow_metadata::bilibili_metadata(&serde_json::json!({
+        "second_area_name": room_info.get("second_area_name"),
+        "second_area_id": room_info.get("second_area_id"),
+        "area_name": room_info.get("area_name"),
+        "area_id": room_info.get("area_id"),
+        "parent_area_name": room_info.get("parent_area_name"),
+        "parent_area_id": room_info.get("parent_area_id"),
+        "online": online,
+    }));
+
     Ok(crate::platforms::common::LiveStreamInfo {
         title,
         anchor_name,
@@ -198,5 +219,8 @@ pub async fn fetch_bilibili_streamer_info(
         available_streams: None,
         normalized_room_id: None,
         web_rid: None,
+        category_name: metadata.category_name,
+        category_id: metadata.category_id,
+        popularity: metadata.popularity,
     })
 }

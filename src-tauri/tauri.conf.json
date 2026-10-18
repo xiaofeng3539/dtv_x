@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "DTV_X",
-  "version": "0.2.10",
+  "version": "0.1.0",
   "identifier": "com.dtvx.app",
   "build": {
     "beforeDevCommand": "pnpm -C web dev",
@@ -64,6 +64,10 @@
           "zh-CN"
         ]
       }
+    },
+    "resources": {
+      "resources/libmpv/libmpv-2.dll": "libmpv/libmpv-2.dll",
+      "resources/libmpv/licenses/": "libmpv/licenses/"
     }
   }
 }

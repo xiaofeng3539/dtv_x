@@ -31,7 +31,7 @@ pub async fn perform_anchor_search(keyword: &str) -> Result<String, Box<dyn std:
             .as_nanos()
             .to_string(),
     );
-    let did = format!("{:x}", hasher.finalize());
+    let did = hex::encode(hasher.finalize());
 
     let url = format!(
         "https://www.douyu.com/japi/search/api/searchUser?kw={}&page=1&pageSize=20&filterType=0",

@@ -15,6 +15,7 @@ pub async fn get_bilibili_live_stream_url_with_quality(
     quality: String,
     cookie: Option<String>,
     line: Option<usize>,
+    native_playback: Option<bool>,
 ) -> Result<crate::platforms::common::LiveStreamInfo, String> {
     let room_id = payload.args.room_id_str.clone();
     if room_id.trim().is_empty() {
@@ -29,6 +30,9 @@ pub async fn get_bilibili_live_stream_url_with_quality(
             available_streams: None,
             normalized_room_id: None,
             web_rid: None,
+            category_name: None,
+            category_id: None,
+            popularity: None,
         });
     }
 
@@ -146,6 +150,9 @@ pub async fn get_bilibili_live_stream_url_with_quality(
             available_streams: None,
             normalized_room_id: None,
             web_rid: None,
+            category_name: None,
+            category_id: None,
+            popularity: None,
         });
     }
 
@@ -317,9 +324,23 @@ pub async fn get_bilibili_live_stream_url_with_quality(
                 available_streams: Some(variants_for_response),
                 normalized_room_id: None,
                 web_rid: None,
+                category_name: None,
+                category_id: None,
+                popularity: None,
             });
         }
     };
+
+    if native_playback.unwrap_or(false) {
+        let url = match &selected_stream { SelectedStream::Flv(url) | SelectedStream::Hls(url) => url.clone() };
+        return Ok(crate::platforms::common::LiveStreamInfo {
+            title: init_json["data"]["title"].as_str().map(str::to_string),
+            anchor_name: init_json["data"]["uname"].as_str().map(str::to_string), avatar: None,
+            stream_url: Some(url.clone()), status: Some(1), error_message: None, upstream_url: Some(url),
+            available_streams: Some(variants_for_response), normalized_room_id: None, web_rid: None,
+            category_name: None, category_id: None, popularity: None,
+        });
+    }
 
     match selected_stream {
         SelectedStream::Flv(real_url) => {
@@ -329,7 +350,7 @@ pub async fn get_bilibili_live_stream_url_with_quality(
                     let mut current_url_in_store = stream_url_store.url.lock().unwrap();
                     *current_url_in_store = real_url.clone();
                 }
-                match start_proxy(app_handle, proxy_server_handle, stream_url_store).await {
+                match start_proxy(app_handle, proxy_server_handle, stream_url_store, Some(real_url.clone())).await {
                     Ok(proxy) => Some(proxy),
                     Err(e) => {
                         eprintln!("[Bilibili] Failed to start proxy: {}", e);
@@ -355,6 +376,9 @@ pub async fn get_bilibili_live_stream_url_with_quality(
                 available_streams: Some(variants_for_response.clone()),
                 normalized_room_id: None,
                 web_rid: None,
+                category_name: None,
+                category_id: None,
+                popularity: None,
             })
         }
         SelectedStream::Hls(real_url) => {
@@ -382,6 +406,9 @@ pub async fn get_bilibili_live_stream_url_with_quality(
                 available_streams: Some(variants_for_response),
                 normalized_room_id: None,
                 web_rid: None,
+                category_name: None,
+                category_id: None,
+                popularity: None,
             })
         }
     }

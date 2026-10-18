@@ -6,11 +6,14 @@ import type { DanmakuMessage, DanmuOverlayInstance, DanmuRenderOptions } from '.
 import { v4 as uuidv4 } from 'uuid';
 import { logger } from '@/utils/logger';
 
+let nativeStreamCache: { key: string; at: number; value: LiveStreamInfo } | null = null;
+
 export async function getBilibiliStreamConfig(
   roomId: string,
   quality: string = '原画',
   cookie?: string,
   candidateIndex: number = 0,
+  nativePlayback: boolean = typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window) && /Windows/i.test(navigator.userAgent),
 ): Promise<{ streamUrl: string, streamType: string | undefined, candidateCount: number }> {
   if (!roomId) {
     throw new Error('房间ID未提供');
@@ -20,14 +23,18 @@ export async function getBilibiliStreamConfig(
   const effectiveCookie = cookie ?? (typeof localStorage !== 'undefined' ? (localStorage.getItem('bilibili_cookie') || undefined) : undefined);
 
   const MAX_ATTEMPTS = 2; // 最多重试一次
+  const cacheKey = JSON.stringify([roomId, quality, effectiveCookie || ""]);
+  const cached = nativePlayback && candidateIndex > 0 && nativeStreamCache?.key === cacheKey && Date.now() - nativeStreamCache.at < 15000 ? nativeStreamCache.value : null;
   let result: LiveStreamInfo | null = null;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
+      if (cached) { result = cached; break; }
       const fetched = await invoke<LiveStreamInfo>('get_bilibili_live_stream_url_with_quality', {
         payload: payloadData,
         quality,
         cookie: effectiveCookie || null,
         line: candidateIndex,
+        nativePlayback,
       });
       result = fetched;
 
@@ -50,6 +57,7 @@ export async function getBilibiliStreamConfig(
         throw new Error('未获取到有效的直播流');
       }
 
+      if (nativePlayback) nativeStreamCache = { key: cacheKey, at: Date.now(), value: result };
       break;
     } catch (e: any) {
       const msg = String(e?.message || e || '').trim();
@@ -80,7 +88,8 @@ export async function getBilibiliStreamConfig(
     });
   }
 
-  const streamUrl = result.stream_url;
+  const nativeCandidates = result.available_streams?.filter(stream => !!stream.url) || [];
+  const streamUrl = nativePlayback ? nativeCandidates[candidateIndex % nativeCandidates.length]?.url || result.upstream_url || result.stream_url : result.stream_url;
   if (!streamUrl) {
     throw new Error('主播未开播或无法获取直播流');
   }

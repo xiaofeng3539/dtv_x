@@ -219,7 +219,7 @@ pub async fn connect_and_manage_websocket(
         };
         let mut heartbeat_buf = Vec::new();
         heartbeat_msg_proto.encode(&mut heartbeat_buf).unwrap(); // Assuming encode is from ProstMessage trait
-        let ws_ping_msg = WsMessage::Ping(heartbeat_buf);
+        let ws_ping_msg = WsMessage::Ping(heartbeat_buf.into());
 
         let mut ticker = tokio::time::interval(Duration::from_secs(5));
 

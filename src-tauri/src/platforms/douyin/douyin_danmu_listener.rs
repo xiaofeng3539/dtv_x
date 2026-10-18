@@ -1,5 +1,5 @@
 use crate::platforms::douyin::web_api::normalize_douyin_live_id;
-use rand::Rng;
+use rand::RngExt;
 use tokio::sync::mpsc as tokio_mpsc;
 use tokio::time::{sleep, Duration};
 
@@ -161,7 +161,7 @@ pub async fn start_douyin_danmu_listener(
                 }
             }
 
-            let jitter_ms: u64 = rand::thread_rng().gen_range(0..=800);
+            let jitter_ms: u64 = rand::rng().random_range(0..=800);
             let sleep_fut = sleep(Duration::from_secs(backoff_secs) + Duration::from_millis(jitter_ms));
             tokio::select! {
                 _ = sleep_fut => {}

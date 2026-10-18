@@ -1,0 +1,8 @@
+{
+  "productName": "DTV Native Surface Probe",
+  "version": "0.2.10",
+  "identifier": "com.dtvx.native-surface-probe",
+  "build": { "frontendDist": "../../../web/out" },
+  "app": { "windows": [], "security": { "csp": null } },
+  "bundle": { "active": false }
+}

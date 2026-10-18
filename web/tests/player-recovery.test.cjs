@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const ts = require('typescript');
+const ts = require('typescript-api');
 
 // 提取真实错误监听器，避免为了测试网络恢复引入 React 测试框架。
 function attachRecovery() {
@@ -13,7 +13,7 @@ function attachRecovery() {
   const body = source.slice(start, end);
   const transpiled = ts.transpileModule(`
     export function attach(player: any, ctx: any) {
-      const { sessionId, isSessionActive, reconnectCooldownUntilRef, reconnectDeferredRef,
+      const { sessionId, isSessionActive, activeSessionIdRef, reconnectCooldownUntilRef, reconnectDeferredRef,
         scheduleReconnect, playerRef, userPausedRef, playbackFailureTimerRef } = ctx;
       ${body}
     }
@@ -27,17 +27,22 @@ function attachRecovery() {
   } });
   const video = { currentTime: 10, readyState: 2, paused: false, ended: false, error: null };
   let handler;
-  let reconnects = 0;
+  let reconnects = 0, activeSession = 1;
   const context = {
-    sessionId: 1, isSessionActive: () => true,
+    sessionId: 1, isSessionActive: (id) => id === activeSession,
+    activeSessionIdRef: { current: 1 },
+    disposedRef: { current: false },
     reconnectCooldownUntilRef: { current: 0 }, reconnectDeferredRef: { current: false },
     playerRef: { current: { root: { querySelector: () => video } } },
     userPausedRef: { current: false }, playbackFailureTimerRef: { current: null },
     scheduleReconnect: () => reconnects++,
   };
-  exports.attach({ on: (_event, callback) => handler = callback }, context);
+  const player = context.playerRef.current;
+  player.on = (_event, callback) => handler = callback;
+  exports.attach(player, context);
   return { video, context, error: () => handler({ message: '网络错误' }),
     runTimers: () => { const callbacks = [...tasks.values()]; tasks.clear(); callbacks.forEach((callback) => callback()); },
+    nextSession() { context.activeSessionIdRef.current = ++activeSession; },
     get reconnects() { return reconnects; }, get timers() { return tasks.size; },
   };
 }
@@ -65,4 +70,25 @@ test('手动暂停和过期会话不触发重连', () => {
   recovery.context.userPausedRef.current = true;
   recovery.runTimers();
   assert.equal(recovery.reconnects, 0);
+});
+
+test('播放器复用切台后，错误监听仍能恢复当前直播', () => {
+  const recovery = attachRecovery();
+  recovery.nextSession();
+  recovery.error();
+  recovery.runTimers();
+  assert.equal(recovery.reconnects, 1);
+});
+
+test('已经销毁的旧播放器即使迟到报错，也不干扰当前直播', () => {
+  const recovery = attachRecovery();
+  recovery.context.playerRef.current = null;
+  recovery.error();
+  recovery.runTimers();
+  assert.equal(recovery.reconnects, 0);
+});
+
+test('libmpv 真正报错不被旧 MSE 冷却期吞掉，立即安排 3 秒复核',()=>{
+ const recovery=attachRecovery();recovery.context.playerRef.current.video=recovery.video;recovery.video.dataset={nativePlayback:'true'};
+ recovery.context.reconnectCooldownUntilRef.current=Date.now()+20000;recovery.error();assert.equal(recovery.timers,1);assert.equal(recovery.context.reconnectDeferredRef.current,false);
 });

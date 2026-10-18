@@ -55,9 +55,9 @@ fn http_client() -> &'static reqwest::Client {
 fn device_id() -> &'static String {
     static DEVICE_ID: OnceLock<String> = OnceLock::new();
     DEVICE_ID.get_or_init(|| {
-        use rand::Rng;
-        let mut rng = rand::thread_rng();
-        (0..32).map(|_| format!("{:x}", rng.gen_range(0..16))).collect()
+        use rand::RngExt;
+        let mut rng = rand::rng();
+        (0..32).map(|_| format!("{:x}", rng.random_range(0..16))).collect()
     })
 }
 
@@ -402,7 +402,19 @@ const USER_SNAPSHOT_QUERY: &str = r#"
 query($l:String!){
   user(login:$l){
     login displayName profileImageURL(width:150)
-    stream{ id title viewersCount previewImageURL(width:320,height:180) game{ displayName } }
+    stream{ id title viewersCount previewImageURL(width:320,height:180) game{ id displayName } }
+  }
+}
+"#;
+
+// 关注专用查询：离线时 stream 为 null，仍从频道官方广播设置取得最近选择的游戏。
+// 不改变播放路径原有的 USER_SNAPSHOT_QUERY，也不增加播放地址请求。
+const FOLLOW_USER_SNAPSHOT_QUERY: &str = r#"
+query($l:String!){
+  user(login:$l){
+    login displayName profileImageURL(width:150)
+    stream{ id title viewersCount game{ id displayName } }
+    broadcastSettings{ title game{ id displayName } }
   }
 }
 "#;
@@ -555,6 +567,10 @@ pub struct TwitchStreamerStatus {
     pub avatar: String,
     pub title: String,
     pub is_live: bool,
+    // 关注分类（游戏/分区分组）：来自同一 GQL 快照的 stream.game
+    pub category_name: Option<String>,
+    pub category_id: Option<String>,
+    pub popularity: Option<f64>,
 }
 
 #[tauri::command]
@@ -563,7 +579,11 @@ pub async fn get_twitch_streamer_status(login: String) -> Result<TwitchStreamerS
     if login_clean.is_empty() {
         return Err("频道名为空".to_string());
     }
-    let user = fetch_user_snapshot(&login_clean).await?;
+    let data = gql(FOLLOW_USER_SNAPSHOT_QUERY, serde_json::json!({ "l": login_clean })).await?;
+    let user = &data["user"];
+    if user.is_null() {
+        return Err("房间不存在".to_string());
+    }
     let nickname = json_str(&user, "displayName")
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -572,16 +592,22 @@ pub async fn get_twitch_streamer_status(login: String) -> Result<TwitchStreamerS
     let title = user
         .pointer("/stream/title")
         .and_then(|v| v.as_str())
+        .or_else(|| user.pointer("/broadcastSettings/title").and_then(|v| v.as_str()))
         .unwrap_or("")
         .trim()
         .to_string();
     let is_live = !user.get("stream").map(|s| s.is_null()).unwrap_or(true);
+    // 分类来自同次关注 GQL：直播游戏优先，离线使用广播设置，不请求播放地址。
+    let metadata = crate::platforms::common::follow_metadata::twitch_metadata(&user);
     Ok(TwitchStreamerStatus {
         login: login_clean,
         nickname,
         avatar,
         title,
         is_live,
+        category_name: metadata.category_name,
+        category_id: metadata.category_id,
+        popularity: metadata.popularity,
     })
 }
 

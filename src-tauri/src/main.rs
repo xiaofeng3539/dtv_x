@@ -20,6 +20,7 @@ mod lan_sync;
 mod sync_transfer;
 mod platforms;
 mod proxy;
+mod native_player;
 use platforms::common::{
     BilibiliDanmakuState, DouyinDanmakuState, FollowHttpClient, HuyaDanmakuState, TwitchDanmakuState,
 };
@@ -241,6 +242,7 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.show();
         let _ = window.unminimize();
         let _ = window.set_focus();
+        native_player::sync_window(app);
         // 通知前端：窗口已回到前台（与 main-window-hidden 成对）。
         // 注意：关到托盘期间播放**从未停止**，所以这里前端不需要重建播放器，
         // 事件只用于清掉后台节流期间积累的检测基准。
@@ -253,6 +255,7 @@ fn show_main_window(app: &tauri::AppHandle) {
 /// pub(crate)：version_check 的「安装器已启动 → 退出」也复用它，保证退出行为一致。
 pub(crate) fn really_quit(app: &tauri::AppHandle) {
     QUITTING.store(true, std::sync::atomic::Ordering::SeqCst);
+    native_player::shutdown(app);
     shutdown_background_tasks(app);
     for (_label, window) in app.webview_windows() {
         let _ = window.close();
@@ -373,6 +376,7 @@ fn main() {
                 Ok(())
             })
             .on_window_event(|window, event| {
+                native_player::window_event(window, event);
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     // 已决定真正退出 → 放行，让窗口真的关掉
                     if QUITTING.load(std::sync::atomic::Ordering::SeqCst) {
@@ -395,10 +399,12 @@ fn main() {
                         //   真正结束这一切的唯一方式是托盘菜单「退出」。
                         let _ = window.app_handle().emit("main-window-hidden", ());
                         let _ = window.hide();
+                        native_player::sync_window(window.app_handle());
                         api.prevent_close();
                     }
                 }
             })
+            .manage(native_player::NativePlayerState::default())
             .manage(client) // Manage the reqwest client
             .manage(follow_http_client) // 专用关注刷新客户端，避免占用默认连接池
             .manage(DouyuDanmakuHandles::default()) // Manage new DouyuDanmakuHandles
@@ -412,6 +418,14 @@ fn main() {
             .manage(lan_sync::LanSyncServerState::default())
             .manage(cache_cleaner::ExitCleanupFlag(std::sync::atomic::AtomicBool::new(true)))
             .invoke_handler(tauri::generate_handler![
+                native_player::native_player_open,
+                native_player::native_player_stop,
+                native_player::native_player_pause,
+                native_player::native_player_volume,
+                native_player::native_player_muted,
+                native_player::native_player_rect,
+                native_player::native_player_snapshot,
+                native_player::native_player_pip,
                 get_stream_url_cmd,
                 get_stream_url_with_quality_cmd,
                 set_stream_url_cmd,

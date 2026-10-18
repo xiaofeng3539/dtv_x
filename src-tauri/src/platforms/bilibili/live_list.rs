@@ -61,7 +61,7 @@ pub async fn fetch_bilibili_live_list(
     );
     let mut hasher = Md5::new();
     hasher.update(sign_string.as_bytes());
-    let w_rid = format!("{:x}", hasher.finalize());
+    let w_rid = hex::encode(hasher.finalize());
 
     let mut params: Vec<(String, String)> =
         pairs.into_iter().map(|(k, v)| (k.to_string(), v)).collect();

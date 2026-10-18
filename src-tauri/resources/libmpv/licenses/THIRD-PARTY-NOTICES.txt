@@ -1,0 +1,19 @@
+DTV Windows native playback resources
+
+libmpv: mpv v0.36.0-403-g652a1dd907; client API 2.1; Windows x64.
+This is the same unmodified LGPL-mode (gpl=false) libmpv binary used by the referenced Simple Live media_kit build.
+DLL SHA-256: d5f0694b08c124e785d858d00082f3e3b158dd9138bfc48c0382bf1eb443a5fc
+Binary release and matching build scripts/source inputs:
+https://github.com/media-kit/libmpv-win32-video-build/releases/tag/2023-09-24
+https://github.com/media-kit/libmpv-win32-video-build
+Archive: mpv-dev-x86_64-20230924-git-652a1dd.7z
+Archive MD5 (verified against media_kit CMake configuration): a832ef24b3a6ff97cd2560b5b9d04cd8
+mpv source revision: https://github.com/mpv-player/mpv/tree/652a1dd907
+mpv copyright and LGPL terms accompany this notice. FFmpeg is linked inside this build; its LGPL text is included.
+The DLL remains a replaceable dynamic library; no external player process is required.
+
+Simple Live playback/configuration and platform selection algorithms were used as a read-only porting reference:
+https://github.com/xiaoyaocz/dart_simple_live
+Reference source files: simple_live_core/lib/src/{bilibili_site,douyu_site,huya_site,douyin_site}.dart; simple_live_app/lib/modules/live_room/{live_room_controller.dart,player/player_controller.dart}.
+Simple Live license: GPL-3.0; included separately. No Dart runtime or Flutter UI is bundled; DTV's React UI is retained.
+DTV's existing LICENSE and attribution are unchanged.

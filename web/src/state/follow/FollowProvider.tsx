@@ -2,8 +2,11 @@
 
 import React, { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { v4 as uuidv4 } from "uuid";
+import { mergeFollowMetadata, reconcileFollowMetadata, stripFollowRuntime } from "./followGrouping";
 
 export type Platform = "DOUYU" | "DOUYIN" | "HUYA" | "BILIBILI" | "TWITCH";
+
+export type FollowStatusFilter = "ALL" | "LIVE" | "OFFLINE";
 
 export type FollowedStreamer = {
   id: string;
@@ -13,6 +16,10 @@ export type FollowedStreamer = {
   roomTitle?: string;
   currentRoomId: string;
   liveStatus: "UNKNOWN" | "LIVE" | "OFFLINE";
+  categoryName?: string;
+  categoryId?: string;
+  /** 仅运行时有效，不持久化或同步。 */
+  popularity?: number;
 };
 
 export interface FollowFolder {
@@ -31,6 +38,10 @@ type FollowContextValue = {
   folders: FollowFolder[];
   listOrder: FollowListItem[];
   hydrated: boolean;
+  platformFilter: "ALL" | Platform;
+  setPlatformFilter: (platform: "ALL" | Platform) => void;
+  statusFilter: FollowStatusFilter;
+  setStatusFilter: (status: FollowStatusFilter) => void;
   consumeInitialAutoRefresh: () => boolean;
   beginTransaction: () => void;
   commitTransaction: () => void;
@@ -130,6 +141,9 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
   const [followedStreamers, setFollowedStreamers] = useState<FollowedStreamer[]>([]);
   const [listOrder, setListOrder] = useState<FollowListItem[]>([]);
   const [hydrated, setHydrated] = useState(false);
+  // 侧栏全屏时会卸载；筛选属于关注视图，不能随列表组件销毁。
+  const [platformFilter, setPlatformFilter] = useState<"ALL" | Platform>("ALL");
+  const [statusFilter, setStatusFilter] = useState<FollowStatusFilter>("ALL");
   const snapshotRef = useRef<{ followedStreamers: FollowedStreamer[]; listOrder: FollowListItem[] } | null>(null);
   const initialAutoRefreshConsumedRef = useRef(false);
 
@@ -139,20 +153,25 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
     const follows = loadJson<FollowedStreamer[]>("followedStreamers", []);
     const loadedFolders = loadJson<FollowFolder[]>("followFolders", []);
     const loadedOrder = loadJson<FollowListItem[]>("followListOrder", []);
+    const filters = loadJson<{ platform?: unknown; status?: unknown } | null>("dtv_follow_filters_v1", null);
+    const savedPlatform = typeof filters?.platform === "string" ? filters.platform : "";
+    setPlatformFilter(isKnownPlatform(savedPlatform) ? savedPlatform : "ALL");
+    setStatusFilter(filters?.status === "LIVE" || filters?.status === "OFFLINE" ? filters.status : "ALL");
 
     let nextOrder: FollowListItem[] = [];
     const byKey = new Map<string, FollowedStreamer>();
 
     for (const s of Array.isArray(follows) ? follows : []) {
       if (!s?.platform || !s?.id) continue;
-      byKey.set(`${s.platform}:${s.id}`, s);
+      byKey.set(`${s.platform}:${s.id}`, reconcileFollowMetadata(s, {}));
     }
 
     for (const item of Array.isArray(loadedOrder) ? loadedOrder : []) {
       if (item?.type !== "streamer") continue;
       const s = item.data as FollowedStreamer;
       if (!s?.platform || !s?.id) continue;
-      byKey.set(`${s.platform}:${s.id}`, s);
+      const key = `${s.platform}:${s.id}`;
+      byKey.set(key, reconcileFollowMetadata(byKey.get(key) ?? s, s));
     }
 
     const folderSources = [
@@ -181,7 +200,9 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
     setFollowedStreamers(nextFollowedStreamers);
 
     if (loadedOrder.length > 0) {
-      nextOrder = loadedOrder;
+      nextOrder = loadedOrder.map((item) => item.type === "streamer"
+        ? { ...item, data: byKey.get(`${item.data.platform}:${item.data.id}`) ?? stripFollowRuntime(item.data) }
+        : item);
     } else if (loadedFolders.length > 0) {
       const folderItems: FollowListItem[] = loadedFolders.map((f) => ({ type: "folder" as const, data: f }));
       const folderStreamerKeys = new Set(loadedFolders.flatMap((f) => f.streamerIds));
@@ -197,7 +218,7 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (!hydrated) return;
-    saveJson("followedStreamers", followedStreamers);
+    saveJson("followedStreamers", followedStreamers.map(stripFollowRuntime));
   }, [followedStreamers, hydrated]);
 
   useEffect(() => {
@@ -207,8 +228,13 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
 
   useEffect(() => {
     if (!hydrated) return;
-    saveJson("followListOrder", listOrder);
+    saveJson("followListOrder", listOrder.map((item) => item.type === "streamer" ? { ...item, data: stripFollowRuntime(item.data) } : item));
   }, [hydrated, listOrder]);
+
+  useEffect(() => {
+    if (!hydrated) return;
+    saveJson("dtv_follow_filters_v1", { platform: platformFilter, status: statusFilter });
+  }, [hydrated, platformFilter, statusFilter]);
 
   const updateStreamer = useCallback((platform: Platform, id: string, patch: Partial<FollowedStreamer>) => {
     const key = `${platform}:${id}`;
@@ -216,8 +242,10 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
       let changed = false;
       const next = prev.map((s) => {
         if (`${s.platform}:${s.id}` !== key) return s;
+        const merged = mergeFollowMetadata(s, patch);
+        if (merged === s) return s;
         changed = true;
-        return { ...s, ...patch };
+        return merged;
       });
       return changed ? next : prev;
     });
@@ -226,8 +254,10 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
       const next = prev.map((item) => {
         if (item.type !== "streamer") return item; // folder 项原样返回，避免无谓重渲染
         if (`${item.data.platform}:${item.data.id}` !== key) return item;
+        const merged = mergeFollowMetadata(item.data, patch);
+        if (merged === item.data) return item;
         changed = true;
-        return { ...item, data: { ...item.data, ...patch } };
+        return { ...item, data: merged };
       });
       // 没有任何变化时返回原数组引用，避免整棵关注列表重渲染
       return changed ? next : prev;
@@ -254,8 +284,10 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
         const next = prev.map((s) => {
           const patch = patchByKey.get(`${s.platform}:${s.id}`);
           if (!patch) return s;
+          const merged = mergeFollowMetadata(s, patch);
+          if (merged === s) return s;
           changed = true;
-          return { ...s, ...patch };
+          return merged;
         });
         return changed ? next : prev;
       });
@@ -265,8 +297,10 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
           if (item.type !== "streamer") return item; // folder 项原样返回
           const patch = patchByKey.get(`${item.data.platform}:${item.data.id}`);
           if (!patch) return item;
+          const merged = mergeFollowMetadata(item.data, patch);
+          if (merged === item.data) return item;
           changed = true;
-          return { ...item, data: { ...item.data, ...patch } };
+          return { ...item, data: merged };
         });
         return changed ? next : prev;
       });
@@ -280,6 +314,10 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
       folders,
       listOrder,
       hydrated,
+      platformFilter,
+      setPlatformFilter,
+      statusFilter,
+      setStatusFilter,
       consumeInitialAutoRefresh: () => {
         if (initialAutoRefreshConsumedRef.current) return false;
         initialAutoRefreshConsumedRef.current = true;
@@ -504,7 +542,7 @@ export function FollowProvider({ children }: { children: React.ReactNode }) {
       updateStreamer,
       updateStreamers
     };
-  }, [followedStreamers, folders, hydrated, listOrder, updateStreamer, updateStreamers]);
+  }, [followedStreamers, folders, hydrated, listOrder, updateStreamer, updateStreamers, platformFilter, statusFilter]);
 
   return <FollowContext.Provider value={value}>{children}</FollowContext.Provider>;
 }

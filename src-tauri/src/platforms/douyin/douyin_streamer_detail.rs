@@ -1,7 +1,6 @@
 // 与 web_api.rs 共用参考 simple_live_core/lib/src/douyin_site.dart（GPL-3.0）的画质候选。
-use crate::platforms::common::http_client::HttpClient;
 use crate::platforms::common::types::StreamVariant;
-use crate::platforms::common::GetStreamUrlPayload;
+use crate::platforms::common::{FollowHttpClient, GetStreamUrlPayload};
 use crate::platforms::common::LiveStreamInfo as CommonLiveStreamInfo;
 use crate::platforms::douyin::web_api::{
     fetch_room_data, normalize_douyin_live_id, normalize_quality_tag, room_status,
@@ -18,12 +17,14 @@ pub async fn get_douyin_live_stream_url(
     app_handle: AppHandle,
     stream_url_store: State<'_, StreamUrlStore>,
     proxy_server_handle: State<'_, ProxyServerHandle>,
+    follow_http: State<'_, FollowHttpClient>,
     payload: GetStreamUrlPayload,
 ) -> Result<CommonLiveStreamInfo, String> {
     get_douyin_live_stream_url_with_quality(
         app_handle,
         stream_url_store,
         proxy_server_handle,
+        follow_http,
         payload,
         QUALITY_OD.to_string(),
     )
@@ -35,6 +36,7 @@ pub async fn get_douyin_live_stream_url_with_quality(
     _app_handle: AppHandle,
     _stream_url_store: State<'_, StreamUrlStore>,
     _proxy_server_handle: State<'_, ProxyServerHandle>,
+    follow_http: State<'_, FollowHttpClient>,
     payload: GetStreamUrlPayload,
     quality: String,
 ) -> Result<CommonLiveStreamInfo, String> {
@@ -51,6 +53,9 @@ pub async fn get_douyin_live_stream_url_with_quality(
             available_streams: None,
             normalized_room_id: None,
             web_rid: None,
+            category_name: None,
+            category_id: None,
+            popularity: None,
         });
     }
 
@@ -59,11 +64,9 @@ pub async fn get_douyin_live_stream_url_with_quality(
         requested_id, quality
     );
 
-    let http_client = HttpClient::new_direct_connection()
-        .map_err(|e| format!("Failed to create direct connection HttpClient: {}", e))?;
-
     let normalized_id = normalize_douyin_live_id(&requested_id);
-    let DouyinRoomData { room } = fetch_room_data(&http_client, &normalized_id, None).await?;
+    // 复用现有直连客户端的连接池和访客会话，避免每次切画质、重连重新握手。
+    let DouyinRoomData { room } = fetch_room_data(&follow_http.0, &normalized_id, None).await?;
     let room_id_str = room
         .get("id_str")
         .and_then(id_string)
@@ -96,6 +99,9 @@ pub async fn get_douyin_live_stream_url_with_quality(
             available_streams: available_streams.clone(),
             normalized_room_id: Some(room_id_str),
             web_rid: Some(web_rid),
+            category_name: None,
+            category_id: None,
+            popularity: None,
         });
     }
 
@@ -120,6 +126,9 @@ pub async fn get_douyin_live_stream_url_with_quality(
         available_streams,
         normalized_room_id: Some(room_id_str),
         web_rid: Some(web_rid),
+        category_name: None,
+        category_id: None,
+        popularity: None,
     })
 }
 

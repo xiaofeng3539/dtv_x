@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const ts = require('typescript');
+const ts = require('typescript-api');
 
 const source = fs.readFileSync(path.join(__dirname, '../src/components/shell/Navbar.tsx'), 'utf8');
 const ast = ts.createSourceFile('Navbar.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);

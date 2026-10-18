@@ -15,8 +15,12 @@ function ensureProxyBase(): Promise<string | null> {
   if (typeof window === "undefined") return Promise.resolve(null);
   if (!proxyBasePromise) {
     proxyBasePromise = invoke<string>("start_static_proxy_server")
-      .then((base) => (base ? String(base).replace(/\/+$/, "") : null))
-      .catch(() => null);
+      .then((base) => {
+        const normalized = base ? String(base).replace(/\/+$/, "") : null;
+        if (!normalized) proxyBasePromise = null;
+        return normalized;
+      })
+      .catch(() => { proxyBasePromise = null; return null; });
   }
   return proxyBasePromise;
 }
@@ -52,12 +56,12 @@ function enforceHttps(url: string): string {
   return url.replace(/^http:\/\//i, "https://");
 }
 
-export async function getTwitchStreamConfig(login: string, quality?: string | null): Promise<TwitchStreamConfig> {
+export async function getTwitchStreamConfig(login: string, quality?: string | null, nativePlayback: boolean = typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window) && /Windows/i.test(navigator.userAgent)): Promise<TwitchStreamConfig> {
   const info = await invoke<TwitchStreamInfoResp>("get_twitch_stream_cmd", {
     login,
     quality: quality || null
   });
-  const proxyBase = await ensureProxyBase();
+  const proxyBase = nativePlayback ? null : await ensureProxyBase();
   const streamUrl = toProxyUrl(proxyBase, enforceHttps(info.selected_url || info.stream_url));
   return {
     streamUrl,

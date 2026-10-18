@@ -81,7 +81,7 @@ fn _encode_wbi(
     let mut hasher = Md5::new();
     hasher.update((query.clone() + &mixin_key).as_bytes());
     let digest = hasher.finalize();
-    let web_sign = format!("{:x}", digest);
+    let web_sign = hex::encode(digest);
     query + &format!("&w_rid={}", web_sign)
 }
 

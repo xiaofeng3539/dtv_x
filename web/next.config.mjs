@@ -7,6 +7,8 @@ const nextConfig = {
   // 这里先关闭以避免开发期“重复请求/空白页”干扰排查。
   reactStrictMode: false,
   experimental: {
+    // TypeScript 7 使用原生编译器，通过 CLI 执行完整类型检查。
+    useTypeScriptCli: true,
     externalDir: true
   }
 };

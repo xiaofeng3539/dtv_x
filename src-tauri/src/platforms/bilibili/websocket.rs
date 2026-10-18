@@ -80,13 +80,13 @@ impl BiliLiveClient {
     pub fn send_auth(&mut self) {
         let pkt = make_packet(self.auth_msg.as_str(), Operation::AUTH);
         ws_debug!("[websocket] sending auth packet, len={}", pkt.len());
-        let _ = self.ws.send(Message::Binary(pkt));
+        let _ = self.ws.send(Message::Binary(pkt.into()));
     }
 
     pub fn send_heart_beat(&mut self) {
         let pkt = make_packet("{}", Operation::HEARTBEAT);
         ws_debug!("[websocket] sending heartbeat, len={}", pkt.len());
-        let _ = self.ws.send(Message::Binary(pkt));
+        let _ = self.ws.send(Message::Binary(pkt.into()));
         // update heartbeat timestamp
         self.last_heartbeat = Instant::now();
     }
@@ -122,7 +122,7 @@ impl BiliLiveClient {
     }
 
     // Parse one frame and collect all messages into pending queue
-    pub fn parse_ws_message(&mut self, resv: Vec<u8>) -> Option<BiliMessage> {
+    pub fn parse_ws_message(&mut self, resv: &[u8]) -> Option<BiliMessage> {
         ws_debug!("[websocket] parse_ws_message: total_len={}", resv.len());
         // 防御性长度校验：帧头固定 16 字节。
         // 服务端可能下发截断帧；ver==3（brotli 压缩）分支解压后还会**递归**调用本函数，
@@ -210,7 +210,7 @@ impl BiliLiveClient {
                     }
                 };
                 ws_debug!("[websocket] decompressed len={}", res.len());
-                return self.parse_ws_message(res);
+                return self.parse_ws_message(&res);
             } else if h.ver == 0 {
                 let s = match String::from_utf8(b.to_vec()) {
                     Ok(s) => s,
@@ -269,7 +269,7 @@ impl BiliLiveClient {
                     ws_debug!("[websocket] read frame bytes={} ", res.len());
                     if res.len() >= 16 {
                         // parse and fill pending queue
-                        let _ = self.parse_ws_message(res);
+                        let _ = self.parse_ws_message(&res);
                         // return one
                         return self.pending.pop_front();
                     } else {
@@ -379,7 +379,7 @@ pub fn connect(v: Value) -> Result<WebSocket<TlsStream<TcpStream>>, String> {
         .connect(host.as_str(), stream)
         .map_err(|e| format!("TLS 握手失败（{host}）：{e}"))?;
     let parsed = Url::parse(ws_url.as_str()).map_err(|e| format!("弹幕地址非法：{e}"))?;
-    let (socket, _resp) = client(parsed, stream).map_err(|e| format!("WebSocket 握手失败：{e}"))?;
+    let (socket, _resp) = client(parsed.as_str(), stream).map_err(|e| format!("WebSocket 握手失败：{e}"))?;
     ws_debug!("[websocket] websocket handshake complete");
     Ok(socket)
 }

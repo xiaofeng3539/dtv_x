@@ -2477,3 +2477,14 @@ video.xgplayer-video {
 }
 
 
+
+/* Native video is behind the transparent WebView; HTML controls/danmu stay above it. */
+.dtv-native-player video.dtv-native-media {
+  opacity: 0 !important;
+  background: transparent !important;
+}
+
+/* Browser fullscreen adds a black top-layer backdrop, above the native video. */
+.dtv-native-player::backdrop {
+  background: transparent !important;
+}

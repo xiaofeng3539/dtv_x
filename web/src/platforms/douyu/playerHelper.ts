@@ -7,6 +7,7 @@ export async function getDouyuStreamConfig(
   quality: string = '原画',
   line?: string | null,
   candidateIndex: number = 0,
+  nativePlayback: boolean = typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window) && /Windows/i.test(navigator.userAgent),
 ): Promise<{ streamUrl: string, streamType: string | undefined }> {
   let finalStreamUrl: string | null = null;
   let streamType: string | undefined = undefined;
@@ -59,9 +60,10 @@ export async function getDouyuStreamConfig(
     throw new Error('未能获取有效的斗鱼直播流地址。');
   }
 
+  if (nativePlayback) return { streamUrl: finalStreamUrl, streamType };
+
   try {
-    await invoke('set_stream_url_cmd', { url: finalStreamUrl });
-    const proxyUrl = await invoke<string>('start_proxy');
+    const proxyUrl = await invoke<string>('start_proxy', { url: finalStreamUrl });
     douyuProxyActive = true;
     return { streamUrl: proxyUrl, streamType };
   } catch (e: any) {

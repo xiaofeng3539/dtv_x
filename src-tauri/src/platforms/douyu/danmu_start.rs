@@ -49,7 +49,7 @@ impl DanmakuClient {
         stop_rx: &mut oneshot::Receiver<()>,
     ) -> Result<ConnectionOutcome, Box<dyn std::error::Error>> {
         let url = Url::parse("wss://danmuproxy.douyu.com:8506/")?;
-        let mut request = url.into_client_request()?;
+        let mut request = url.as_str().into_client_request()?;
         request
             .headers_mut()
             .insert("Sec-WebSocket-Protocol", "binary".parse()?);
@@ -61,12 +61,12 @@ impl DanmakuClient {
         // 发送登录请求
         let login_msg = format!("type@=loginreq/roomid@={}/", self.room_id);
         let login_data = self.encode_msg(&login_msg);
-        write.send(Message::Binary(login_data)).await?;
+        write.send(Message::Binary(login_data.into())).await?;
 
         // 发送加入房间请求
         let join_msg = format!("type@=joingroup/rid@={}/gid@=1/", self.room_id);
         let join_data = self.encode_msg(&join_msg);
-        write.send(Message::Binary(join_data)).await?;
+        write.send(Message::Binary(join_data.into())).await?;
 
         // 创建消息通道
         let (tx, mut rx) = mpsc::channel(32);
@@ -79,7 +79,7 @@ impl DanmakuClient {
         let heartbeat_task = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(45)).await;
-                if let Err(_) = tx_clone.send(Message::Binary(heartbeat_data.clone())).await {
+                if let Err(_) = tx_clone.send(Message::Binary(heartbeat_data.clone().into())).await {
                     break;
                 }
             }

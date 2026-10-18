@@ -8,12 +8,14 @@ import { logger } from '@/utils/logger';
 export interface HuyaUnifiedEntry { quality: string; bitRate: number; url: string; }
 
 let huyaProxyActive = false;
+let nativeStreamCache: { key: string; at: number; value: any } | null = null;
 
 export async function getHuyaStreamConfig(
   roomId: string,
   quality: string = '原画',
   line?: string | null,
   candidateIndex: number = 0,
+  nativePlayback: boolean = typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window) && /Windows/i.test(navigator.userAgent),
 ): Promise<{
   streamUrl: string;
   streamType: string | undefined;
@@ -24,11 +26,13 @@ export async function getHuyaStreamConfig(
   candidateCount: number;
 }> {
   logger.debug('[HuyaPlayerHelper] getHuyaStreamConfig', { roomId, quality, line });
+  const cacheKey = JSON.stringify([roomId, quality, line]);
   const MAX_ATTEMPTS = 2; // 最多重试一次
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
-      const result = await invoke<any>('get_huya_unified_cmd', { roomId: roomId, quality, line: line ?? null });
+      const cached = nativePlayback && candidateIndex > 0 && nativeStreamCache?.key === cacheKey && Date.now() - nativeStreamCache.at < 15000 ? nativeStreamCache.value : null;
+      const result = cached || await invoke<any>('get_huya_unified_cmd', { roomId: roomId, quality, line: line ?? null });
       logger.debug('[HuyaPlayerHelper] getHuyaStreamConfig result', result);
 
       if (result && result.flv_tx_urls && Array.isArray(result.flv_tx_urls)) {
@@ -38,15 +42,15 @@ export async function getHuyaStreamConfig(
           ? candidates[candidateIndex % candidates.length]
           : result.selected_url || pickHuyaUrlByQuality(result.flv_tx_urls, quality) || result.flv_tx_urls[0]?.url;
         if (!upstreamStreamUrl) throw new Error('未获取到有效的虎牙直播流');
+        if (nativePlayback && !cached) nativeStreamCache = { key: cacheKey, at: Date.now(), value: result };
 
         const sanitizedUpstream = upstreamStreamUrl;
         const streamType = inferStreamType(sanitizedUpstream);
 
         // 对齐 pure_live：虎牙播放需要稳定的 UA/Referer/Origin；WebView 无法给 FLV 请求加自定义 Header，走本地 proxy 注入。
         let finalStreamUrl = sanitizedUpstream;
-        try {
-          await invoke('set_stream_url_cmd', { url: sanitizedUpstream });
-          const proxyUrl = await invoke<string>('start_proxy');
+        if (!nativePlayback) try {
+          const proxyUrl = await invoke<string>('start_proxy', { url: sanitizedUpstream });
           if (proxyUrl) {
             finalStreamUrl = proxyUrl;
             huyaProxyActive = true;

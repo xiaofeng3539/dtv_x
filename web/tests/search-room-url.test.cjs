@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
-const ts = require('typescript');
+const ts = require('typescript-api');
 
 function triggerSearch(query, activePlatform = 'douyu', composing = false, method = 'enter') {
   const file = path.join(__dirname, '../src/components/shell/Navbar.tsx');

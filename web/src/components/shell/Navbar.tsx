@@ -473,7 +473,7 @@ export function Navbar({
   const showResults = isSearchFocused && !!searchQuery.trim();
 
   return (
-    <nav className={`${styles.navbar} ${theme === "dark" ? styles.navbarDark : ""}`} data-tauri-drag-region>
+    <nav className={`${styles.navbar} ${theme === "dark" ? styles.navbarDark : ""} ${isPlayerOpen ? styles.navbarPlayer : ""}`} data-tauri-drag-region>
       <div className={styles.platformTabsWrap} data-tauri-drag-region>
         <div className={styles.platformTabs} ref={containerRef} data-tauri-drag-region>
           <m.div

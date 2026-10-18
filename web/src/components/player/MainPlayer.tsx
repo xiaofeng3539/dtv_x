@@ -10,6 +10,7 @@ import { POSITIONS } from "xgplayer/es/plugin/plugin.js";
 
 import "xgplayer/dist/index.min.css";
 import "./player.css";
+import { createNativePlayback, usesNativePlayback } from "./nativePlayback";
 
 import type { DanmakuMessage, DanmuOverlayInstance, RustGetStreamUrlPayload } from "@/components/player/types";
 import type { DanmuKeywordBlockPreferences, DanmuUserSettings } from "@/components/player/constants";
@@ -424,7 +425,6 @@ export function MainPlayer({
   const [playerAnchorName, setPlayerAnchorName] = useState<string | null>(null);
   const [playerAvatar, setPlayerAvatar] = useState<string | null>(null);
   const [playerIsLive, setPlayerIsLive] = useState<boolean | null>(null);
-  const [isWindows, setIsWindows] = useState(false);
 
   // 把最新播放状态镜像给卡死看门狗：看门狗跑在定时器里、不在渲染周期内，读不到最新 state。
   // 这里赋值是幂等的、不触发渲染，StrictMode 双渲染也安全。
@@ -435,7 +435,6 @@ export function MainPlayer({
     live: playerIsLive,
     reconnecting: reconnectNotice !== null
   };
-  const [isMaximized, setIsMaximized] = useState(false);
 
   const lineOptions: LineOption[] = useMemo(() => lineOptionsByPlatform[platform] ?? [], [platform]);
   const [currentQuality, setCurrentQuality] = useState<string>(() =>
@@ -465,6 +464,18 @@ export function MainPlayer({
     const stored = loadDanmuPreferences();
     return stored?.enabled ?? true;
   });
+  // ★ 弹幕开关的"活引用"：startDanmaku 的监听器闭包只在挂载时创建一次，
+  //   若直接捕获 isDanmuEnabled state，之后切换开关监听器里永远是旧值 ——
+  //   表现为"进房间时关着弹幕、再打开也没有弹幕"。
+  //   监听器必须读 ref.current 才能拿到最新开关状态。
+  const isDanmuEnabledRef = useRef(isDanmuEnabled);
+  useEffect(() => {
+    isDanmuEnabledRef.current = isDanmuEnabled;
+  }, [isDanmuEnabled]);
+  // 记录上一次的开关状态，用于识别"从关到开"的边沿：
+  // 重新开启时要先清掉 pause 期间积压的弹幕池，再恢复渲染，
+  // 否则积压的旧弹幕会一次性涌出/内部队列状态可能无法恢复。
+  const prevDanmuEnabledRef = useRef(isDanmuEnabled);
   const [danmuSettings, setDanmuSettings] = useState<DanmuUserSettings>(() => {
     if (typeof window === "undefined") return DEFAULT_DANMU_SETTINGS;
     const stored = loadDanmuPreferences();
@@ -521,95 +532,6 @@ export function MainPlayer({
   const [chromeVisible, setChromeVisible] = useState(true);
   const hideChromeTimerRef = useRef<number | null>(null);
   const moveRafRef = useRef(0);
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const osMod: any = await import("@tauri-apps/plugin-os");
-        const p = typeof osMod?.platform === "function" ? await osMod.platform() : "";
-        if (cancelled) return;
-        const platform = String(p).toLowerCase();
-        setIsWindows(platform === "windows" || platform === "linux");
-      } catch {
-        // non-tauri env: ignore
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!isWindows) return;
-    let cancelled = false;
-    let unlisten: null | (() => void) = null;
-    (async () => {
-      try {
-        const { getCurrentWindow } = await import("@tauri-apps/api/window");
-        const win = getCurrentWindow();
-        try {
-          const max = await win.isMaximized();
-          if (!cancelled) setIsMaximized(!!max);
-        } catch {
-          // ignore
-        }
-        try {
-          unlisten = await win.onResized(async () => {
-            try {
-              const max = await win.isMaximized();
-              setIsMaximized(!!max);
-            } catch {
-              // ignore
-            }
-          });
-        } catch {
-          // ignore
-        }
-      } catch {
-        // ignore
-      }
-    })();
-    return () => {
-      cancelled = true;
-      try {
-        unlisten?.();
-      } catch {
-        // ignore
-      }
-    };
-  }, [isWindows]);
-
-  const minimizeWindow = useCallback(async () => {
-    try {
-      const { getCurrentWindow } = await import("@tauri-apps/api/window");
-      await getCurrentWindow().minimize();
-    } catch {
-      // ignore
-    }
-  }, []);
-
-  const toggleMaximizeWindow = useCallback(async () => {
-    try {
-      const { getCurrentWindow } = await import("@tauri-apps/api/window");
-      const win = getCurrentWindow();
-      const max = await win.isMaximized();
-      if (max) await win.unmaximize();
-      else await win.maximize();
-      setIsMaximized(!max);
-    } catch {
-      // ignore
-    }
-  }, []);
-
-  const closeWindow = useCallback(async () => {
-    try {
-      const { getCurrentWindow } = await import("@tauri-apps/api/window");
-      await getCurrentWindow().close();
-    } catch {
-      // ignore
-    }
-  }, []);
 
   const startWindowDragging = useCallback(async () => {
     try {
@@ -858,7 +780,7 @@ export function MainPlayer({
     // ★ 但这里必须**暂存**而不是直接丢弃：若窗口期内真的断了一次流，
     //   直接 return 就再也没人会发起这次重连了（内核 error 被吞、看门狗又在窗口内躺平），
     //   结果是永久黑屏、只能手动刷新。暂存后由看门狗在窗口到期时捡起来补排。
-    if (Date.now() < reconnectCooldownUntilRef.current) {
+    if (Date.now() < reconnectCooldownUntilRef.current && playerRef.current?.video?.dataset?.nativePlayback !== "true") {
       reconnectDeferredRef.current = true;
       return;
     }
@@ -915,7 +837,7 @@ export function MainPlayer({
 
     reconnectAttemptRef.current = attempt + 1;
     const seq = attempt + 1;
-    const delay = RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)];
+    const delay = playerRef.current?.video?.dataset?.nativePlayback === "true" && attempt === 0 ? 0 : RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)];
     console.info(`[Player] 连接中断（${reason}），${delay}ms 后进行第 ${seq}/${RECONNECT_MAX_ATTEMPTS} 次自动重连`);
     setReconnectNotice(
       delay >= 1000
@@ -1058,7 +980,8 @@ export function MainPlayer({
       if (userPausedRef.current) return;
       // 窗口关到托盘：后台照常播放，但 Chromium 会节流定时器与解码，
       // 此时的「缓冲不增长」多半是节流而非断流，一律不判故障。
-      if (windowHiddenRef.current) {
+      const nativeKernel = video.dataset?.nativePlayback === "true";
+      if (windowHiddenRef.current && !nativeKernel) {
         lastProgressRef.current = { time: video.currentTime, at: now };
         lastBufferedRef.current = { end: bufferedEnd, at: now };
         // ★ 后台保活：即便已通过启动参数禁用了后台解码优化，
@@ -1090,7 +1013,7 @@ export function MainPlayer({
       }
       // 免打扰期内不判断流：刚恢复的流最容易出现「重建缓冲 → 短暂停顿」，
       // 这时触发重连只会把好端端的流又推倒重来（越重连越卡）。
-      if (now < reconnectCooldownUntilRef.current) {
+      if (now < reconnectCooldownUntilRef.current && !nativeKernel) {
         // 窗口内的基准照样推进，避免窗口结束时把「窗口开始前的旧时刻」
         // 当作断流起点而立刻误判
         lastProgressRef.current = { time: video.currentTime, at: now };
@@ -1122,9 +1045,10 @@ export function MainPlayer({
         }
         // 缓冲不涨 + 画面不动 → 累计静止时长
         const stillSince = bCur.at || now;
-        if (now - stillSince >= STALL_STUCK_MS) {
+        const stallTimeout = nativeKernel ? 15000 : STALL_STUCK_MS;
+        if (now - stillSince >= stallTimeout) {
           console.warn(
-            `[Player] 缓冲与播放头均无变化超过 ${STALL_STUCK_MS / 1000}s，判定断流`
+            `[Player] 缓冲与播放头均无变化超过 ${stallTimeout / 1000}s，判定断流`
           );
           lastBufferedRef.current = { end: bufferedEnd, at: now };
           lastProgressRef.current = { time: video.currentTime, at: now };
@@ -1143,7 +1067,9 @@ export function MainPlayer({
       }
       const prev2 = lastProgressRef.current;
       const stillSince2 = prev2.at || now;
-      if (now - stillSince2 >= 45000) {
+      // 首帧/缓冲从未到达时也要保存起点；否则每轮都是 now，永远不会超时。
+      if (!prev2.at) lastProgressRef.current = { time: video.currentTime, at: now };
+      if (now - stillSince2 >= (nativeKernel ? 15000 : 45000)) {
         lastProgressRef.current = { time: video.currentTime, at: now };
         scheduleReconnect("画面无推进");
       }
@@ -1430,10 +1356,8 @@ export function MainPlayer({
       roomIdToStart: string,
       roomIdToFilter?: string
     ) => {
+      if (!roomIdToStart || !isSessionActive(sessionId)) return;
       clearDanmakuListeners();
-
-       if (!roomIdToStart) return;
-       if (!isSessionActive(sessionId)) return;
 
        try {
          try {
@@ -1441,8 +1365,7 @@ export function MainPlayer({
          } catch {
            // ignore
          }
-         // Always stop existing backends first (cross-platform), then start the current one.
-         await stopAllDanmakuBackends();
+         // reloadStream 已统一停止旧弹幕；这里不重复等待一轮跨平台 IPC。
          if (!isSessionActive(sessionId)) return;
 
          if (platformToStart === Platform.DOUYU) {
@@ -1494,7 +1417,7 @@ export function MainPlayer({
           }
         }
 
-        if (isDanmuEnabled && overlay?.sendComment) {
+        if (isDanmuEnabledRef.current && overlay?.sendComment) {
           try {
             overlay.sendComment({
               id: msg.id,
@@ -1526,7 +1449,7 @@ export function MainPlayer({
       }
       unlistenRef.current.add(unlisten);
     },
-    [isDanmuEnabled, isSessionActive, stopAllDanmakuBackends, clearDanmakuListeners]
+    [isSessionActive, clearDanmakuListeners]
   );
 
   const mountPlayer = useCallback(
@@ -1561,6 +1484,7 @@ export function MainPlayer({
         import("@/components/player/plugins")
       ]);
 
+      if (!isSessionActive(sessionId)) return;
       const FlvPlugin: any = (flvMod as any).default ?? flvMod;
       const HlsPlugin: any = (hlsMod as any).default ?? hlsMod;
       const { applyDanmuOverlayPreferences, createDanmuOverlay, syncDanmuEnabledState } = overlayMod as any;
@@ -1605,6 +1529,9 @@ export function MainPlayer({
         }
       };
 
+      const nativePlayback = usesNativePlayback() ? await createNativePlayback(platform) : null;
+      if (nativePlayback && !isSessionActive(sessionId)) { await nativePlayback.dispose(); return; }
+      if (!nativePlayback) {
       if (isHlsPlayback) {
         // Referer/Origin 伪装头仅对 B 站 CDN 生效。
         // Twitch 的 playlist 边缘节点会对带第三方 Origin 的请求返回 403，
@@ -1624,12 +1551,18 @@ export function MainPlayer({
 
         playerOptions.plugins = [HlsPlugin];
         playerOptions.useHlsPlugin = true;
-        playerOptions.hls = {
+        playerOptions.hlsJsPlugin = { hlsOpts: {
           isLive: true,
           // 弱网容忍：默认 3 次 / 1000ms 对直播偏紧，抖一下就放弃。
           // 提高到 5 次 / 1500ms，配合应用层自动重连形成两级兜底。
-          retryCount: 5,
-          retryDelay: 1500,
+          manifestLoadingTimeOut: 10000,
+          manifestLoadingMaxRetry: 2,
+          manifestLoadingRetryDelay: 500,
+          levelLoadingTimeOut: 10000,
+          levelLoadingMaxRetry: 2,
+          fragLoadingTimeOut: 15000,
+          fragLoadingMaxRetry: 3,
+          fragLoadingRetryDelay: 1000,
           enableWorker: true,
           withCredentials: false,
           lowLatencyMode: false,
@@ -1656,7 +1589,7 @@ export function MainPlayer({
               // ignore
             }
           }
-        };
+        } };
       } else {
         // 弱网/兼容性兜底：部分 WebView2 环境对 `hev1` codec 字符串不支持，但对 `hvc1` 支持。
         // xgplayer-transmuxer 默认会生成 `hev1.*`，这里在运行时探测后做一次 monkey patch。
@@ -1717,7 +1650,14 @@ export function MainPlayer({
         };
       }
 
+      } else {
+        playerOptions.mediaEl = nativePlayback.video;
+        playerOptions.plugins = [];
+      }
+
+      if (!isSessionActive(sessionId)) { await nativePlayback?.dispose(); return; }
       const player = new (PlayerCtor as any)(playerOptions);
+      nativePlayback?.attach(player);
       playerRef.current = player;
       if (!isSessionActive(sessionId)) {
         try {
@@ -1755,13 +1695,13 @@ export function MainPlayer({
       // 只能手动点刷新」的原因（旧代码只监听了全屏/destroy 事件，完全没监听 error）。
       try {
         player.on?.("error", (err: any) => {
-          if (!isSessionActive(sessionId)) return;
+          if (playerRef.current !== player) return;
           const detail = (err && (err.errorType || err.type || err.errorCode || err.message)) || "unknown";
           // 免打扰期内不立刻重连：内核的 disconnectRetryCount 重试过程中也会抛 error，
           // 若不拦，内核每重试一次就被应用层判成「故障」→ 疯狂叠加重连。
           // 但要记下 deferred —— 若这次 error 是真断流（而非内核重试），
           // 窗口到期后必须有人补排，否则就是永久黑屏。
-          if (Date.now() < reconnectCooldownUntilRef.current) {
+          if (Date.now() < reconnectCooldownUntilRef.current && playerRef.current?.video?.dataset?.nativePlayback !== "true") {
             console.info("[Player] 免打扰期内暂缓处理内核错误（优先交给内核自愈）:", detail);
             reconnectDeferredRef.current = true;
             return;
@@ -1771,9 +1711,10 @@ export function MainPlayer({
           if (playbackFailureTimerRef.current !== null) return;
           const video = playerRef.current?.root?.querySelector("video") as HTMLVideoElement | null;
           const position = video?.currentTime ?? 0;
+          const failureSessionId = activeSessionIdRef.current;
           playbackFailureTimerRef.current = window.setTimeout(() => {
             playbackFailureTimerRef.current = null;
-            if (!isSessionActive(sessionId) || userPausedRef.current) return;
+            if (playerRef.current !== player || !isSessionActive(failureSessionId) || userPausedRef.current) return;
             const current = playerRef.current?.root?.querySelector("video") as HTMLVideoElement | null;
             if (current && !current.ended && !current.error &&
                 (current.currentTime > position || (!current.paused && current.readyState >= 3))) return;
@@ -1785,7 +1726,7 @@ export function MainPlayer({
         // 天生会间歇性停住，那个条件几乎永远不成立 —— 于是预算永远回不满，
         // 看门狗每 30 秒就判定「重连链条停滞」补一次，表现为「重连一次后无限重连」。
         player.on?.("playing", () => {
-          if (!isSessionActive(sessionId)) return;
+          if (playerRef.current !== player) return;
           // 恢复播放 = 用户（或内核自愈）解除了暂停
           userPausedRef.current = false;
           notePlaybackProgress();
@@ -1795,9 +1736,11 @@ export function MainPlayer({
         //   都表现为 paused === true，但前者绝不能被判成假死而触发重连。
         //   没有这个标记，看门狗会把用户主动暂停的画面当成断流，反复重连。
         player.on?.("play", () => {
+          if (playerRef.current !== player) return;
           userPausedRef.current = false;
         });
         player.on?.("pause", () => {
+          if (playerRef.current !== player) return;
           // ★ 只有紧跟一次真实用户操作（点暂停按钮 / 按空格）的 pause 才算「用户主动暂停」。
           //   下面这些都同样会触发 pause 事件，但都不是用户意图：
           //     · 窗口不可见时 Chromium 的省电/后台视频优化自动暂停
@@ -1809,7 +1752,7 @@ export function MainPlayer({
           //   → 用户回到前台看到「解码失败」，只能手动点刷新。
           const video = (playerRef.current as any)?.video as HTMLVideoElement | undefined;
           if (!video || video.ended) return;
-          userPausedRef.current = Date.now() - lastUserInputAtRef.current < 800;
+          userPausedRef.current = video.dataset?.nativePlayback === "true" || Date.now() - lastUserInputAtRef.current < 800;
         });
       } catch {
         // ignore
@@ -1902,9 +1845,11 @@ export function MainPlayer({
         // ignore
       }
 
+      if (nativePlayback) await nativePlayback.ready;
+      if (!isSessionActive(sessionId)) return;
       const backendRoomId = danmakuBackendRoomIdOverride || roomId;
       const filterRoomId = danmakuFilterRoomIdOverride || backendRoomId;
-      await startDanmaku(sessionId, overlay, platform, backendRoomId, filterRoomId);
+      void startDanmaku(sessionId, overlay, platform, backendRoomId, filterRoomId).catch((e) => console.warn("[Player] 弹幕初始化失败:", e));
     },
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [
@@ -2041,6 +1986,7 @@ export function MainPlayer({
       // loading 永久为真，之后每一次重连都被守卫吞掉，画面就一直转圈直到手动刷新。
       try {
         await stopAllDanmakuBackends();
+        if (!isSessionActive(sessionId)) return;
         await stopAllProxies();
         if (!isSessionActive(sessionId)) return;
 
@@ -2078,9 +2024,10 @@ export function MainPlayer({
               if (ret && typeof (ret as any).then === "function") await ret;
               if (isSessionActive(sessionId)) {
                 playbackKindRef.current = nextKind;
-                await startDanmaku(sessionId, danmuOverlayRef.current, platform, roomId);
+                void startDanmaku(sessionId, danmuOverlayRef.current, platform, roomId).catch((e) => console.warn("[Player] 弹幕初始化失败:", e));
               }
             } catch {
+              if (!isSessionActive(sessionId)) return;
               destroyPlayer();
               await mountPlayer(sessionId, streamUrl, streamType);
             }
@@ -2115,9 +2062,10 @@ export function MainPlayer({
               if (ret && typeof (ret as any).then === "function") await ret;
               if (isSessionActive(sessionId)) {
                 playbackKindRef.current = nextKind;
-                await startDanmaku(sessionId, danmuOverlayRef.current, platform, danmakuBackendRoomId, danmakuFilterRoomId);
+                void startDanmaku(sessionId, danmuOverlayRef.current, platform, danmakuBackendRoomId, danmakuFilterRoomId).catch((e) => console.warn("[Player] 弹幕初始化失败:", e));
               }
             } catch {
+              if (!isSessionActive(sessionId)) return;
               destroyPlayer();
               await mountPlayer(sessionId, resp.streamUrl, resp.streamType, danmakuBackendRoomId, danmakuFilterRoomId);
             }
@@ -2154,9 +2102,10 @@ export function MainPlayer({
               if (ret && typeof (ret as any).then === "function") await ret;
               if (isSessionActive(sessionId)) {
                 playbackKindRef.current = nextKind;
-                await startDanmaku(sessionId, danmuOverlayRef.current, platform, roomId);
+                void startDanmaku(sessionId, danmuOverlayRef.current, platform, roomId).catch((e) => console.warn("[Player] 弹幕初始化失败:", e));
               }
             } catch {
+              if (!isSessionActive(sessionId)) return;
               destroyPlayer();
               await mountPlayer(sessionId, streamUrl, streamType);
             }
@@ -2192,9 +2141,10 @@ export function MainPlayer({
               if (ret && typeof (ret as any).then === "function") await ret;
               if (isSessionActive(sessionId)) {
                 playbackKindRef.current = nextKind;
-                await startDanmaku(sessionId, danmuOverlayRef.current, platform, roomId);
+                void startDanmaku(sessionId, danmuOverlayRef.current, platform, roomId).catch((e) => console.warn("[Player] 弹幕初始化失败:", e));
               }
             } catch {
+              if (!isSessionActive(sessionId)) return;
               destroyPlayer();
               await mountPlayer(sessionId, streamUrl, streamType);
             }
@@ -2227,9 +2177,10 @@ export function MainPlayer({
               if (ret && typeof (ret as any).then === "function") await ret;
               if (isSessionActive(sessionId)) {
                 playbackKindRef.current = nextKind;
-                await startDanmaku(sessionId, danmuOverlayRef.current, platform, roomId);
+                void startDanmaku(sessionId, danmuOverlayRef.current, platform, roomId).catch((e) => console.warn("[Player] 弹幕初始化失败:", e));
               }
             } catch {
+              if (!isSessionActive(sessionId)) return;
               destroyPlayer();
               await mountPlayer(sessionId, cfg.streamUrl, cfg.streamType);
             }
@@ -2280,27 +2231,23 @@ export function MainPlayer({
           pendingReconnectReason = "取流失败";
         }
       } finally {
-        autoReconnectModeRef.current = false;
         // 只有自己仍是最新会话时才收尾 —— 被抢占 / 被判挂死作废的旧会话
         // 绝不能把新会话的 in-flight 锁与 loading 状态误清掉。
         const stillCurrent = isSessionActive(sessionId);
         if (stillCurrent) {
+          autoReconnectModeRef.current = false;
           reloadInFlightRef.current = false;
           setIsLoadingStream(false);
-        }
-        // 网络中断：等 in-flight 守卫复位后再调度重连
-        if (stillCurrent && pendingReconnectReason !== null) {
-          scheduleReconnect(pendingReconnectReason);
-        }
-        // 补偿调度：本次取流期间被守卫挡下的重连请求（见 scheduleReconnect 注释）
-        const deferred = reconnectDeferredRef.current;
-        if (deferred) {
+          // 先消费旧标记，再调度；scheduleReconnect 在冷却期会重新置位。
+          // 反过来会把刚排入的恢复请求清掉，留下无播放器、无重试的永久黑屏。
+          // 过期会话也不能消费新会话的标记或修改其重建状态。
+          const deferred = reconnectDeferredRef.current;
           reconnectDeferredRef.current = false;
-          if (stillCurrent && pendingReconnectReason === null) {
+          if (pendingReconnectReason !== null) {
+            scheduleReconnect(pendingReconnectReason);
+          } else if (deferred) {
             scheduleReconnect("补偿调度");
           }
-        }
-        if (stillCurrent) {
           const pending = pendingReloadRef.current;
           pendingReloadRef.current = null;
           if (pending) {
@@ -2366,6 +2313,18 @@ export function MainPlayer({
 
   useEffect(() => {
     // Keep danmu overlay + controls in sync
+    // 从关到开的边沿：先清掉 pause 期间积压在弹幕池里的旧弹幕，
+    // 再恢复渲染 —— 不清的话重新开启瞬间积压弹幕一次性涌出，
+    // 且 danmu.js 内部队列状态可能无法正常恢复（弹幕再也加载不出来）。
+    const turningOn = isDanmuEnabled && !prevDanmuEnabledRef.current;
+    prevDanmuEnabledRef.current = isDanmuEnabled;
+    if (turningOn) {
+      try {
+        danmuOverlayRef.current?.clear?.();
+      } catch {
+        // ignore
+      }
+    }
     import("@/components/player/danmuOverlay")
       .then((mod: any) => {
         mod.applyDanmuOverlayPreferences?.(danmuOverlayRef.current, danmuSettings, isDanmuEnabled, playerRef.current?.root as any);
@@ -2455,46 +2414,6 @@ export function MainPlayer({
       onPointerUpCapture={onPlayerPointerUpCapture}
       onPointerCancelCapture={onPlayerPointerUpCapture}
     >
-      {isWindows ? (
-        <div className="player-window-controls" data-tauri-drag-region="false" aria-label="窗口控制">
-          <button type="button" className="window-btn" data-tauri-drag-region="false" aria-label="最小化" onClick={() => void minimizeWindow()}>
-            <svg viewBox="0 0 24 24" fill="none">
-              <path d="M6 12h12" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-            </svg>
-          </button>
-          <button
-            type="button"
-            className="window-btn"
-            data-tauri-drag-region="false"
-            aria-label={isMaximized ? "还原" : "最大化"}
-            onClick={() => void toggleMaximizeWindow()}
-          >
-            {!isMaximized ? (
-              <svg viewBox="0 0 24 24" fill="none">
-                <rect x="6.5" y="6.5" width="11" height="11" rx="1.6" stroke="currentColor" strokeWidth="1.8" />
-              </svg>
-            ) : (
-              <svg viewBox="0 0 24 24" fill="none">
-                <path d="M9 7.5h8a2 2 0 0 1 2 2v8" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-                <rect x="5.5" y="9.5" width="11" height="11" rx="1.6" stroke="currentColor" strokeWidth="1.8" />
-              </svg>
-            )}
-          </button>
-          <button
-            type="button"
-            className="window-btn window-btn--close"
-            data-tauri-drag-region="false"
-            aria-label="关闭软件"
-            onClick={() => void closeWindow()}
-          >
-            <svg viewBox="0 0 24 24" fill="none">
-              <path d="M7 7l10 10" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-              <path d="M17 7L7 17" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-            </svg>
-          </button>
-        </div>
-      ) : null}
-
       <div className="player-layout">
         <div className="main-content">
           <div className="player-container player-container--solo">
@@ -2542,8 +2461,8 @@ export function MainPlayer({
                         {playerAnchorName || "未知主播"} · ID:{roomId}
                       </div>
                     </div>
-                    <div className={`player-topbar-status ${playerIsLive === false ? "is-offline" : "is-live"}`}>
-                      {isLoadingStream ? "加载中" : playerIsLive === false ? "未开播" : "直播中"}
+                    <div className={`player-topbar-status ${playerIsLive === false ? "is-offline" : playerIsLive === true ? "is-live" : ""}`}>
+                      {isLoadingStream ? "加载中" : playerIsLive === false ? "未开播" : playerIsLive === true ? "直播中" : "状态未知"}
                     </div>
                     <button
                       type="button"

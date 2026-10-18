@@ -29,3 +29,8 @@
   display: flex;
   flex-direction: column;
 }
+
+/* The opaque panel already covers the modal; its backdrop must not tint the native video underneath. */
+.overlayRoot:has(:global(.dtv-native-player)) > .backdrop {
+  visibility: hidden;
+}

@@ -223,6 +223,14 @@ const buildOverlayInstance = (
       }
     },
     clear: () => {
+      // ★ 必须先调 danmu.clear() 清掉内部 data 池 / queue / channel：
+      //   弹幕关闭期间监听器仍在往池里积压数据，仅清 DOM 的话重新开启时
+      //   积压弹幕会一次性涌出，且内部队列状态可能无法恢复。
+      try {
+        danmu.clear?.();
+      } catch {
+        // ignore
+      }
       try {
         const state: any = (danmu as any)?.state;
         if (state?.bullets && Array.isArray(state.bullets)) {

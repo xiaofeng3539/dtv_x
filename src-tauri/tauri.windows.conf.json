@@ -11,7 +11,7 @@
           "x": 18,
           "y": 33
         },
-        "transparent": false,
+        "transparent": true,
         "title": "",
         "fullscreen": false,
         "resizable": true,

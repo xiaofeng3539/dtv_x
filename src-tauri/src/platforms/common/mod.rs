@@ -1,5 +1,6 @@
 #![allow(unused_imports)]
 pub mod http_client;
+pub mod follow_metadata;
 pub mod types;
 pub mod types_rust;
 

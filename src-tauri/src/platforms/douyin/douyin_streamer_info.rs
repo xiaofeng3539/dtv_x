@@ -1,8 +1,13 @@
 use crate::platforms::common::http_client::HttpClient;
 use crate::platforms::common::{FollowHttpClient, GetStreamUrlPayload, LiveStreamInfo};
-use crate::platforms::douyin::web_api::{fetch_room_data, normalize_douyin_live_id, DouyinRoomData};
+use crate::platforms::douyin::web_api::{fetch_follow_room_data, normalize_douyin_live_id, DouyinRoomData};
+use std::sync::OnceLock;
 use tauri::command;
 use tauri::State;
+
+// 抖音分类目录缓存：整个应用共享一个；失败/空目录不缓存，允许下次重试。
+static DIRECTORY_CACHE: OnceLock<crate::platforms::douyin::follow_category::DirectoryCache> =
+    OnceLock::new();
 
 #[command]
 pub async fn fetch_douyin_streamer_info(
@@ -22,6 +27,9 @@ pub async fn fetch_douyin_streamer_info(
             available_streams: None,
             normalized_room_id: None,
             web_rid: None,
+            category_name: None,
+            category_id: None,
+            popularity: None,
         });
     }
 
@@ -29,7 +37,7 @@ pub async fn fetch_douyin_streamer_info(
 
     let normalized_id = normalize_douyin_live_id(&requested_id);
 
-    match fetch_room_data(http_client, &normalized_id, None).await {
+    match fetch_follow_room_data(http_client, &normalized_id, None).await {
         Ok(DouyinRoomData { room }) => {
             let web_rid = super::douyin_streamer_detail::extract_web_rid(&room)
                 .unwrap_or_else(|| normalized_id.clone());
@@ -45,6 +53,15 @@ pub async fn fetch_douyin_streamer_info(
             let avatar = super::douyin_streamer_detail::extract_avatar(&room);
             let available_streams = super::douyin_streamer_detail::collect_available_streams(&room);
 
+            // 分类取官方分区路径最深一级；只有 ID 时共享补查分类目录（不额外解析播放）。
+            let cache = DIRECTORY_CACHE.get_or_init(Default::default);
+            let directory_client = follow_http.0.inner.clone();
+            let metadata =
+                super::follow_category::metadata_with_directory(&room, cache, move || {
+                    super::follow_category::fetch_douyin_directory_page(directory_client)
+                })
+                .await;
+
             Ok(LiveStreamInfo {
                 title,
                 anchor_name,
@@ -56,6 +73,9 @@ pub async fn fetch_douyin_streamer_info(
                 available_streams,
                 normalized_room_id: None,
                 web_rid: Some(web_rid),
+                category_name: metadata.category_name,
+                category_id: metadata.category_id,
+                popularity: metadata.popularity,
             })
         }
         Err(e) => Ok(LiveStreamInfo {
@@ -69,6 +89,9 @@ pub async fn fetch_douyin_streamer_info(
                 available_streams: None,
                 normalized_room_id: None,
                 web_rid: Some(normalized_id),
+                category_name: None,
+                category_id: None,
+                popularity: None,
         }),
     }
 }

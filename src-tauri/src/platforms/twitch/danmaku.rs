@@ -106,8 +106,8 @@ pub async fn start_twitch_danmaku_listener(
                 // 匿名登录三件套
                 let nick = format!("justinfan{}", 10_000 + (rand::random::<u64>() % 90_000));
                 let _ = out_tx.send(WsMessage::Text("CAP REQ :twitch.tv/tags twitch.tv/commands".into()));
-                let _ = out_tx.send(WsMessage::Text(format!("NICK {}", nick)));
-                let _ = out_tx.send(WsMessage::Text(format!("JOIN #{}", channel_clone)));
+                let _ = out_tx.send(WsMessage::Text(format!("NICK {}", nick).into()));
+                let _ = out_tx.send(WsMessage::Text(format!("JOIN #{}", channel_clone).into()));
 
                 // 写者任务：独占 ws_write
                 let writer_task = async {

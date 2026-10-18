@@ -7,7 +7,7 @@ use base64::{engine::general_purpose, Engine as _};
 use bytes04::Bytes;
 use futures_util::future::join_all;
 use md5::{Digest, Md5};
-use rand::Rng;
+use rand::RngExt;
 use regex::Regex;
 use reqwest::header::{
     HeaderMap, HeaderValue, ACCEPT, ORIGIN, REFERER, USER_AGENT,
@@ -46,13 +46,17 @@ pub struct HuyaUnifiedResponse {
     pub flv_tx_urls: Vec<HuyaUnifiedStreamEntry>,
     pub selected_url: Option<String>,
     pub candidate_urls: Vec<String>,
+    // 关注分类（游戏/分区分组）：来自 profile 同一响应，游戏全名优先
+    pub category_name: Option<String>,
+    pub category_id: Option<String>,
+    pub popularity: Option<f64>,
 }
 
 fn md5_hex(input: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(input.as_bytes());
     let digest = hasher.finalize();
-    format!("{:x}", digest)
+    hex::encode(digest)
 }
 
 fn current_millis() -> i64 {
@@ -152,9 +156,9 @@ fn build_huya_anti_code(
         .ok_or_else(|| "missing fs in anti code".to_string())?;
 
     let ws_time_int = i64::from_str_radix(ws_time.trim(), 16).unwrap_or(0);
-    let mut rng = rand::thread_rng();
-    let ct = (((ws_time_int as f64) + rng.gen::<f64>()) * 1000.0) as i64;
-    let uuid = ((((ct % 10_000_000_000i64) as f64) + rng.gen::<f64>()) * 1000.0
+    let mut rng = rand::rng();
+    let ct = (((ws_time_int as f64) + rng.random::<f64>()) * 1000.0) as i64;
+    let uuid = ((((ct % 10_000_000_000i64) as f64) + rng.random::<f64>()) * 1000.0
         % (0xFFFF_FFFFu64 as f64)) as u32;
 
     let mut parts = Vec::<(String, String)>::new();
@@ -724,18 +728,33 @@ fn extract_room_detail(profile: &Value) -> RoomDetail {
 
 // 关注列表和搜索只需要房间元信息，不执行播放线路解析或 WUP 鉴权。
 fn extract_room_metadata(profile: &Value) -> Result<HuyaUnifiedResponse, String> {
-    validate_profile_room(profile)?;
+    // REPLAY 和 OFF 一样不是直播，但仍保留官方分区；不改变播放器校验。
+    let is_replay = profile.pointer("/data/liveStatus").and_then(Value::as_str) == Some("REPLAY");
+    if is_replay {
+        if parse_i64_lossy(profile.get("status")) != 200
+            || profile.get("data").and_then(Value::as_object).is_none()
+        {
+            return Err("虎牙房间接口返回无效回放数据".to_string());
+        }
+    } else {
+        validate_profile_room(profile)?;
+    }
     let detail = extract_room_detail(profile);
+    // 分类只来自 profile 同一响应（liveData.gameFullName 优先），不额外发请求。
+    let metadata = crate::platforms::common::follow_metadata::huya_metadata(profile);
     Ok(HuyaUnifiedResponse {
         title: detail.title,
         nick: detail.nick,
         avatar: detail.avatar180,
         introduction: None,
         profileRoom: None,
-        is_live: detail.status,
+        is_live: detail.status && !is_replay,
         flv_tx_urls: Vec::new(),
         selected_url: None,
         candidate_urls: Vec::new(),
+        category_name: metadata.category_name,
+        category_id: metadata.category_id,
+        popularity: metadata.popularity,
     })
 }
 
@@ -1044,6 +1063,63 @@ fn collect_candidate_base_urls(
     urls
 }
 
+// 关注专用路径：别名通过官方页面的房间字段规范化，不从标题/昵称推断。
+fn follow_room_id_from_page(page: &str) -> Result<String, String> {
+    let room = Regex::new(r#"(?s)(?:var\s+)?TT_ROOM_DATA\s*=\s*(\{.*?\})\s*;"#)
+        .map_err(|e| e.to_string())?;
+    if let Some(caps) = room.captures(page) {
+        if let Ok(value) = serde_json::from_str::<Value>(&caps[1]) {
+            let id = parse_i64_lossy(value.get("profileRoom"));
+            if id > 0 { return Ok(id.to_string()); }
+        }
+    }
+    // 部分移动端仍返回 HNF_GLOBAL_INIT；只在该官方初始化对象中取数字房号。
+    let init = Regex::new(r#"(?s)window\.HNF_GLOBAL_INIT\s*=\s*(\{.*?\})\s*;?\s*</script>"#)
+        .map_err(|e| e.to_string())?;
+    if let Some(caps) = init.captures(page) {
+        let id = Regex::new(r#""lProfileRoom"\s*:\s*"?([1-9][0-9]*)"?"#)
+            .map_err(|e| e.to_string())?;
+        if let Some(room) = id.captures(&caps[1]) { return Ok(room[1].to_string()); }
+    }
+    Err("虎牙官方页面未返回有效房间号".to_string())
+}
+
+async fn fetch_follow_room_metadata(
+    client: &reqwest::Client,
+    room_id: &str,
+) -> Result<HuyaUnifiedResponse, String> {
+    static ALIAS_ROOMS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+    let aliases = ALIAS_ROOMS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let cached = aliases.lock().map_err(|e| e.to_string())?.get(room_id).cloned();
+    let is_alias = !room_id.bytes().all(|b| b.is_ascii_digit());
+    let canonical_id = if let Some(id) = cached {
+        id
+    } else if is_alias {
+        let page = client.get(format!("https://m.huya.com/{}", room_id))
+            .header(USER_AGENT, DESKTOP_UA).send().await.map_err(|e| e.to_string())?
+            .error_for_status().map_err(|e| e.to_string())?
+            .text().await.map_err(|e| e.to_string())?;
+        follow_room_id_from_page(&page)?
+    } else {
+        room_id.to_string()
+    };
+    // 不走播放专用 fetch_profile_room 的流字段校验；关注允许 REPLAY 无 stream。
+    let profile: Value = client.get(format!(
+        "https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid={}&showSecret=1", canonical_id))
+        .header(ACCEPT, "*/*").header(ORIGIN, "https://www.huya.com")
+        .header(REFERER, "https://www.huya.com/").header(USER_AGENT, DESKTOP_UA)
+        .send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
+    let mut metadata = extract_room_metadata(&profile)?;
+    metadata.profileRoom = Some(canonical_id.clone());
+    if is_alias {
+        // 仅完成有效房间查询后缓存成功映射，失败可于下次重试。
+        aliases.lock().map_err(|e| e.to_string())?.insert(room_id.to_string(), canonical_id);
+    }
+    Ok(metadata)
+}
+
 #[tauri::command]
 pub async fn get_huya_unified_cmd(
     room_id: String,
@@ -1054,13 +1130,15 @@ pub async fn get_huya_unified_cmd(
 ) -> Result<HuyaUnifiedResponse, String> {
     let client = &follow_http.0.inner;
 
+    if metadata_only.unwrap_or(false) {
+        return fetch_follow_room_metadata(client, &room_id).await;
+    }
     let profile = fetch_profile_room(client, &room_id)
         .await
         .map_err(|e| e.to_string())?;
-    if metadata_only.unwrap_or(false) {
-        return extract_room_metadata(&profile);
-    }
     let detail = extract_room_detail(&profile);
+    // 播放响应同样带上分类元数据，与 metadata_only 路径保持一致。
+    let metadata = crate::platforms::common::follow_metadata::huya_metadata(&profile);
     let candidates = extract_stream_candidates(&profile)?;
     if candidates.is_empty() && !profile_room_is_offline(&profile) {
         return Err("虎牙房间接口未返回可用直播线路，请稍后重试".to_string());
@@ -1129,6 +1207,9 @@ pub async fn get_huya_unified_cmd(
         flv_tx_urls: tx_entries,
         selected_url,
         candidate_urls,
+        category_name: metadata.category_name,
+        category_id: metadata.category_id,
+        popularity: metadata.popularity,
     })
 }
 #[allow(dead_code)]
@@ -1163,6 +1244,58 @@ mod tests {
         assert!(!extract_room_metadata(&offline).unwrap().is_live);
         for profile in [serde_json::json!({"status": 503}), serde_json::json!({"status": 200, "data": {}})] {
             assert!(extract_room_metadata(&profile).is_err());
+        }
+    }
+
+
+    #[test]
+    fn room_metadata_keeps_replay_category_without_stream() {
+        // profileRoom/116864 实际形状：REPLAY 没有 stream，仍有官方游戏。
+        let profile = serde_json::json!({"status":200,"data":{
+            "liveStatus":"REPLAY", "liveData":{"gameFullName":"无畏契约","gid":5937},
+            "profileInfo":{"nick":"主播"}
+        }});
+        let metadata = extract_room_metadata(&profile).unwrap();
+        assert!(!metadata.is_live);
+        assert_eq!(metadata.category_name.as_deref(), Some("无畏契约"));
+        // 关注修复不改变原播放路径校验。
+        assert!(validate_profile_room(&profile).is_err());
+    }
+
+    #[test]
+    fn follow_offline_keeps_official_category_without_stream() {
+        let profile = serde_json::json!({"status":200,"data":{
+            "liveStatus":"OFF","liveData":{"gameFullName":"英雄联盟","gid":1}
+        }});
+        let metadata = extract_room_metadata(&profile).unwrap();
+        assert!(!metadata.is_live);
+        assert_eq!(metadata.category_name.as_deref(), Some("英雄联盟"));
+    }
+
+    #[tokio::test]
+    #[ignore = "requires public Huya HTTP access"]
+    async fn follow_metadata_real_offline_replay_and_aliases() {
+        let client = reqwest::Client::builder().no_proxy()
+            .timeout(Duration::from_secs(15)).build().unwrap();
+        for id in ["941103", "116864", "chuhe", "cxy0714"] {
+            let metadata = fetch_follow_room_metadata(&client, id).await.unwrap();
+            println!("HUYA_FOLLOW {} {}", id, serde_json::to_string(&metadata).unwrap());
+            assert!(metadata.category_name.is_some());
+            assert!(metadata.profileRoom.as_deref().unwrap().bytes().all(|b| b.is_ascii_digit()));
+            assert!(metadata.candidate_urls.is_empty());
+            assert!(metadata.selected_url.is_none());
+        }
+    }
+
+    #[test]
+    fn follow_alias_uses_only_official_room_fields() {
+        // m.huya.com/chuhe 当前重定向桌面页的实际字段形状。
+        let desktop = r#"<script>var TT_ROOM_DATA = {"state":"OFF","gameFullName":"主机游戏","profileRoom":998};</script>"#;
+        assert_eq!(follow_room_id_from_page(desktop).unwrap(), "998");
+        let mobile = r#"<script>window.HNF_GLOBAL_INIT = {"roomInfo":{"tLiveInfo":{"lProfileRoom":770714,"sGameFullName":"英雄联盟"}}};</script>"#;
+        assert_eq!(follow_room_id_from_page(mobile).unwrap(), "770714");
+        for invalid in [r#"<h1>主播998</h1>"#, r#"<script>var OTHER_DATA={"profileRoom":998};</script>"#, r#"<script>var TT_ROOM_DATA={"profileRoom":0};</script>"#] {
+            assert!(follow_room_id_from_page(invalid).is_err());
         }
     }
 

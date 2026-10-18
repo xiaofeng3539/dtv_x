@@ -17,7 +17,7 @@ test('Windows 主窗口关闭原生标题栏，避免与现有自定义按钮重
 });
 
 test('Windows 平台配置保留原有窗口及 WebView 参数', () => {
-  assert.deepEqual(effectiveWindows, base.app.windows.map((window) => ({ ...window, decorations: false })));
+  assert.deepEqual(effectiveWindows, base.app.windows.map((window) => ({ ...window, decorations: false, transparent: true })));
 });
 
 test('通用配置保留 macOS 原生按钮与覆盖式标题栏', () => {
@@ -26,3 +26,5 @@ test('通用配置保留 macOS 原生按钮与覆盖式标题栏', () => {
   assert.equal(main.titleBarStyle, 'Overlay');
   assert.deepEqual(main.trafficLightPosition, { x: 18, y: 33 });
 });
+
+test('Windows 视频层通过透明 WebView 显示，不改变其他平台窗口',()=>{assert.equal(effectiveWindows.find(w=>w.label==='main').transparent,true);assert.equal(base.app.windows.find(w=>w.label==='main').transparent,false);});

@@ -56,6 +56,10 @@ pub struct LiveStreamInfo {
     pub normalized_room_id: Option<String>,
     // 新增：直播间的 web_rid（用于关注列表以 web_id 为主键）
     pub web_rid: Option<String>,
+    // 关注分类（游戏/分区分组）：来自关注刷新同一响应，仅元数据；未开播或缺失时为 None
+    pub category_name: Option<String>,
+    pub category_id: Option<String>,
+    pub popularity: Option<f64>,
 }
 
 #[derive(Default, Clone)]

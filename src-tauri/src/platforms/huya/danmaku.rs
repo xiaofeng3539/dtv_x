@@ -156,7 +156,7 @@ pub async fn start_huya_danmaku_listener(
                 let (ws_stream, _) = connect_async(&ws_url).await?;
 
                 let (mut ws_write, mut ws_read) = ws_stream.split();
-                ws_write.send(WsMessage::Binary(reg_data)).await?;
+                ws_write.send(WsMessage::Binary(reg_data.into())).await?;
 
                 let hb_task = async {
                     let mut hb_seq = 0usize;

@@ -1,0 +1,55 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8">
+<link rel="stylesheet" href="xgplayer-probe.css">
+<style>
+html,body{margin:0;background:transparent;color:white;font:16px system-ui}header,pre{margin:0;background:#17191e;padding:14px 24px}
+#stage{position:relative;margin:20px 40px;width:calc(100% - 80px);height:420px}
+.xgplayer,.xgplayer video{background:transparent!important}.xgplayer video{opacity:0}
+.danmu{position:absolute;top:35%;left:12%;z-index:5;font-size:28px;text-shadow:0 2px 3px black;pointer-events:none}
+pre{font-size:12px;white-space:pre-wrap}
+</style>
+<header>现有 xgplayer 控件 + libmpv worker（浏览器不拉流）</header>
+<div id="stage"></div><pre id="result">验证中</pre>
+<script>window.addEventListener('error',e=>window.__TAURI_INTERNALS__.invoke('probe_report',{report:{scriptError:e.message,file:e.filename,line:e.lineno}}));window.addEventListener('unhandledrejection',e=>window.__TAURI_INTERNALS__.invoke('probe_report',{report:{unhandled:String(e.reason)}}));</script><script src="xgplayer-probe.js"></script><script src="native-media-probe.js"></script>
+<script>
+(async()=>{
+const ipc=(command,args)=>window.__TAURI_INTERNALS__.invoke(command,args);
+const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const assert=(ok,message)=>{if(!ok)throw Error(message);};
+async function until(fn,message){const deadline=Date.now()+7000;while(!fn()){assert(Date.now()<deadline,message);await sleep(30);}}
+let player,adapter,timer;
+async function sync(){
+ const state=await ipc('probe_snapshot');adapter.accept(state);
+ const r=player.root.getBoundingClientRect(),d=devicePixelRatio;
+ await ipc('probe_rect',{x:Math.round(r.x*d),y:Math.round(r.y*d),width:Math.round(r.width*d),height:Math.round(r.height*d)});
+ document.getElementById('result').textContent=JSON.stringify({native:state,html:{readyState:adapter.video.readyState,currentTime:adapter.video.currentTime,paused:adapter.video.paused,volume:adapter.video.volume,muted:adapter.video.muted}},null,2);
+}
+async function main(){
+ try {
+  const media=await ipc('probe_media');
+  const video=document.createElement('video');
+  adapter=exports.createNativeMedia(video,async(command,args)=>{
+   if(command==='native_player_open')return ipc('probe_start',args);
+   if(command==='native_player_stop')return ipc('probe_stop');
+   const map={native_player_pause:['pause',args.paused?1:0],native_player_volume:['volume',args.volume],native_player_muted:['muted',args.muted?1:0]};
+   assert(map[command],'unimplemented probe control '+command);
+   return ipc('probe_control',{generation:args.generation,kind:map[command][0],value:map[command][1]});
+  });
+  player=new Player({el:document.getElementById('stage'),url:media,mediaEl:video,autoplay:true,isLive:true,width:'100%',height:'100%',volume:1,playsinline:true});
+  const danmu=document.createElement('div');danmu.className='danmu';danmu.textContent='现有控件与 HTML 弹幕覆盖原生视频';player.root.appendChild(danmu);
+  timer=setInterval(()=>sync().catch(console.error),150);
+  await adapter.ready;await ipc('probe_focus');await until(()=>video.readyState===4,'native video never reached existing controls');
+  assert(video.getAttribute('src')===null,'browser received stream source');
+  assert(player.video===video,'xgplayer ignored supplied media');
+  player.pause();await until(()=>video.paused,'pause not reflected');await sleep(150);
+  assert((await ipc('probe_snapshot')).paused,'native pause missing');
+  player.volume=0.27;player.muted=true;await sleep(200);
+  const sound=await ipc('probe_snapshot');assert(Math.abs(sound.volume-0.27)<0.001&&sound.muted,'native sound controls failed');
+  await player.play();await until(()=>!video.paused,'resume not reflected');
+  await ipc('probe_report',{report:{stage:'existing-xgplayer-controls',passed:true,generation:adapter.generation,sound}});
+  await adapter.dispose();player.destroy();clearInterval(timer);
+  await ipc('probe_report',{report:{done:true,passed:true,stage:'controls-and-dispose'}});
+ } catch(error){clearInterval(timer);await ipc('probe_report',{report:{done:true,passed:false,error:String(error)}});}
+}
+main();
+})();
+</script></html>

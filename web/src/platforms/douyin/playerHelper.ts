@@ -15,13 +15,15 @@ export interface DouyinRustDanmakuPayload {
   fans_club_level: number; // from Rust's i32
 }
 
-export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality: string = '原画', candidateIndex: number = 0): Promise<{
+let nativeStreamCache: { key: string; at: number; value: LiveStreamInfo } | null = null;
+
+export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality: string = '原画', candidateIndex: number = 0, nativePlayback: boolean = typeof window !== "undefined" && ("__TAURI_INTERNALS__" in window) && /Windows/i.test(navigator.userAgent)): Promise<{
   streamUrl: string | null;
   streamType: string | undefined; 
   title?: string | null; 
   anchorName?: string | null; 
   avatar?: string | null; 
-  isLive: boolean; 
+  isLive: boolean | null;
   normalizedRoomId?: string | null;
   webRid?: string | null;
   initialError: string | null; // Made non-optional, will always be string or null
@@ -43,12 +45,14 @@ export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality:
 
   const payloadData = { args: { room_id_str: roomId } };
   const backendQuality = normalizeDouyinQuality(quality);
+  const cacheKey = JSON.stringify([roomId, backendQuality]);
   const MAX_ATTEMPTS = 2; // 最多重试一次
 
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
     try {
       // 使用画质参数调用抖音画质切换API
-      const result = await invoke<LiveStreamInfo>('get_douyin_live_stream_url_with_quality', {
+      const cached = nativePlayback && candidateIndex > 0 && nativeStreamCache?.key === cacheKey && Date.now() - nativeStreamCache.at < 15000 ? nativeStreamCache.value : null;
+      const result = cached || await invoke<LiveStreamInfo>('get_douyin_live_stream_url_with_quality', {
         payload: payloadData,
         quality: backendQuality,
       });
@@ -64,7 +68,7 @@ export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality:
             title: result.title,
             anchorName: result.anchor_name,
             avatar: result.avatar,
-            isLive: result.status === 2,
+            isLive: result.status === 2 ? true : result.status === 4 ? false : null,
             normalizedRoomId: result.normalized_room_id ?? null,
             webRid: result.web_rid ?? null,
             initialError: errorMsg,
@@ -78,7 +82,7 @@ export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality:
       const rawStreamUrl = result.stream_url ?? null;
 
       // 未开播：不重试
-      if (result.status != null && result.status !== 2) {
+      if (result.status === 4) {
         return {
           streamUrl: null,
           streamType: undefined,
@@ -101,16 +105,17 @@ export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality:
             title: result.title,
             anchorName: result.anchor_name,
             avatar: result.avatar,
-            isLive: false,
+            isLive: result.status === 2 ? true : null,
             normalizedRoomId: result.normalized_room_id ?? null,
             webRid: result.web_rid ?? null,
-            initialError: '主播在线，但获取直播流失败。',
+            initialError: result.status === 2 ? '主播在线，但获取直播流失败。' : '直播状态暂时无法确认，请重试。',
           };
         }
         await new Promise((resolve) => setTimeout(resolve, 450));
         continue;
       }
 
+      if (nativePlayback && !cached) nativeStreamCache = { key: cacheKey, at: Date.now(), value: result };
       const candidates = result.available_streams?.filter((stream) => !!stream.url) || [];
       const selected = candidates.length ? candidates[candidateIndex % candidates.length] : undefined;
       const sanitizedStreamUrl = selected?.url || rawStreamUrl;
@@ -137,7 +142,7 @@ export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality:
           title: null,
           anchorName: null,
           avatar: null,
-          isLive: false,
+          isLive: null,
           normalizedRoomId: null,
           webRid: null,
           initialError: String(e?.message || e || '获取直播信息失败: 未知错误'),
@@ -153,10 +158,10 @@ export async function fetchAndPrepareDouyinStreamConfig(roomId: string, quality:
     title: null,
     anchorName: null,
     avatar: null,
-    isLive: false,
+    isLive: null,
     normalizedRoomId: null,
     webRid: null,
-    initialError: '主播未开播或无法获取直播流',
+    initialError: '暂时无法获取直播信息，请重试。',
   };
 }
 

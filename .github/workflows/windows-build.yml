@@ -6,11 +6,7 @@ permissions:
   actions: read
 
 on:
-  push:
-    tags:
-      - 'v*.*.*'
-      - '*.*'
-      - '*.*.*'
+  # Release assets are uploaded manually; tags must not trigger automatic uploads.
   workflow_dispatch:
     inputs:
       version:

@@ -525,8 +525,8 @@ pub async fn lan_sync_discover(timeout_ms: Option<u64>) -> Result<Vec<LanSyncDis
 
             // Prefer LAN-reachable IPv4 (avoid APIPA/link-local like 169.254.* that is often not routable between hosts).
             for ip in info.get_addresses() {
-                if let IpAddr::V4(v4) = ip {
-                    if is_shareable_lan_ipv4(v4) {
+                if let IpAddr::V4(v4) = ip.to_ip_addr() {
+                    if is_shareable_lan_ipv4(&v4) {
                         host_ip = Some(ip.to_string());
                         break;
                     }
@@ -536,7 +536,7 @@ pub async fn lan_sync_discover(timeout_ms: Option<u64>) -> Result<Vec<LanSyncDis
             // Fallback: any private IPv4 (still avoid loopback).
             if host_ip.is_none() {
                 for ip in info.get_addresses() {
-                    if matches!(ip, IpAddr::V4(v4) if !v4.is_loopback() && v4.is_private()) {
+                    if matches!(ip.to_ip_addr(), IpAddr::V4(v4) if !v4.is_loopback() && v4.is_private()) {
                         host_ip = Some(ip.to_string());
                         break;
                     }

@@ -23,7 +23,7 @@ pub async fn handle_received_messages(
         match message_result {
             Ok(ws_msg) => {
                 if let WsMessage::Binary(bin_data) = ws_msg {
-                    match PushFrame::decode(bin_data.as_slice()) {
+                    match PushFrame::decode(bin_data.as_ref()) {
                         Ok(push_frame) => {
                             if push_frame.payload_type == "msg" && !push_frame.payload.is_empty() {
                                 let mut gz = GzDecoder::new(push_frame.payload.as_slice());
@@ -46,7 +46,7 @@ pub async fn handle_received_messages(
                                             let mut ack_buf = Vec::new();
                                             if ack_push_frame.encode(&mut ack_buf).is_ok() {
                                                 if ack_tx
-                                                    .send(WsMessage::Binary(ack_buf))
+                                                    .send(WsMessage::Binary(ack_buf.into()))
                                                     .await
                                                     .is_err()
                                                 {

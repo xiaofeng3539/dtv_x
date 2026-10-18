@@ -140,7 +140,7 @@ impl DouYu {
             runtime.execute_script("[douyu]", deno_core::FastString::from(call_expr))?;
 
         let params = {
-            let scope = &mut runtime.handle_scope();
+            deno_core::scope!(scope, runtime);
             let result = js_result.open(scope);
             result.to_rust_string_lossy(scope)
         };
@@ -600,6 +600,18 @@ pub async fn get_stream_url_with_quality(
 #[cfg(test)]
 mod douyu_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn embedded_cryptojs_signing_survives_v8_upgrade() {
+        let douyu = DouYu::new("123").await.unwrap();
+        let result = douyu.execute_js_sign(
+            "function ub98484234(rid,did,ts){return rid+'|'+did+'|'+ts+'|'+CryptoJS.MD5('abc').toString();}",
+            "123'\\房间",
+            "设备\"标识",
+            1700000000,
+        ).await.unwrap();
+        assert_eq!(result, "123'\\房间|设备\"标识|1700000000|900150983cd24fb0d6963f7d28e17f72");
+    }
 
     #[test]
     fn ordinary_cdns_keep_api_order_and_scdn_is_backup() {

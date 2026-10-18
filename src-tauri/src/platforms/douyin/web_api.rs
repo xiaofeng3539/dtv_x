@@ -7,10 +7,16 @@ use reqwest::header::{
     HeaderMap, HeaderValue, ACCEPT_ENCODING, COOKIE, REFERER, SET_COOKIE, USER_AGENT,
 };
 use serde_json::Value;
+use std::time::Duration;
 
 pub const DEFAULT_USER_AGENT: &str =
     "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/116.0.5845.97 Safari/537.36 Core/1.116.567.400 QQBrowser/19.7.6764.400";
 const LIVE_BASE: &str = "https://live.douyin.com";
+const API_TIMEOUT: Duration = Duration::from_secs(3);
+const COOKIE_TIMEOUT: Duration = Duration::from_secs(1);
+const PAGE_TIMEOUT: Duration = Duration::from_secs(4);
+// 前端还有一次短暂失败重试，单轮查询必须在播放器 20 秒看门狗之前结束。
+const ROOM_TIMEOUT: Duration = Duration::from_secs(9);
 
 #[derive(Debug, Clone)]
 pub struct DouyinRoomData {
@@ -20,7 +26,7 @@ pub struct DouyinRoomData {
 pub fn room_status(room: &Value) -> Result<i32, String> {
     room.get("status")
         .and_then(Value::as_i64)
-        .filter(|status| *status >= 0)
+        .filter(|status| matches!(*status, 2 | 4))
         .and_then(|status| i32::try_from(status).ok())
         .ok_or_else(|| "抖音房间数据缺少有效直播状态".to_string())
 }
@@ -80,7 +86,7 @@ fn merge_cookies(original: Option<&str>, updates: &HeaderMap) -> String {
 
 async fn refresh_web_cookie(http: &HttpClient, page: &str, cookies: Option<&str>) -> String {
     match request_headers(page, cookies) {
-        Ok(headers) => match http.inner.head(page).headers(headers).send().await {
+        Ok(headers) => match http.inner.head(page).headers(headers).timeout(COOKIE_TIMEOUT).send().await {
             // HEAD 即使返回 404 也可能发放访客会话。
             Ok(response) => merge_cookies(cookies, response.headers()),
             Err(_) => cookies.unwrap_or_default().to_string(),
@@ -109,6 +115,7 @@ async fn request_api_room(
         .inner
         .get(api)
         .headers(headers)
+        .timeout(API_TIMEOUT)
         .send()
         .await
         .map_err(|e| RoomApiError {
@@ -136,13 +143,16 @@ async fn request_api_room(
         })?;
     room_status(&room).map_err(|message| RoomApiError {
         message,
-        refresh_session: true,
+        refresh_session: room.get("status").and_then(Value::as_i64).is_none(),
     })?;
     if let Some(user) = json.pointer("/data/user").filter(|user| user.is_object()) {
         let object = room.as_object_mut().unwrap();
         if object.get("owner").map_or(true, |owner| !owner.is_object()) {
             object.insert("anchor".into(), user.clone());
         }
+    }
+    if let Some(info) = json.get("data") {
+        crate::platforms::common::follow_metadata::preserve_douyin_partition(&mut room, info);
     }
     Ok(DouyinRoomData { room })
 }
@@ -232,6 +242,7 @@ fn parse_room_html(html: &str) -> Result<DouyinRoomData, String> {
                 .unwrap()
                 .insert("anchor".into(), anchor.clone());
         }
+        crate::platforms::common::follow_metadata::preserve_douyin_partition(&mut room, info);
         if room_status(&room).is_ok() {
             return Ok(DouyinRoomData { room });
         }
@@ -245,32 +256,61 @@ async fn fetch_room_by_web_rid(
     cookies: Option<&str>,
     base: &str,
 ) -> Result<DouyinRoomData, String> {
+    fetch_room_by_web_rid_inner(http, id, cookies, base, false).await
+}
+
+async fn fetch_room_by_web_rid_for_follow(http: &HttpClient, id: &str, cookies: Option<&str>, base: &str) -> Result<DouyinRoomData, String> {
+    fetch_room_by_web_rid_inner(http, id, cookies, base, true).await
+}
+
+async fn fetch_room_by_web_rid_inner(http: &HttpClient, id: &str, cookies: Option<&str>, base: &str, retain_category: bool) -> Result<DouyinRoomData, String> {
     match fetch_room_from_api(http, id, cookies, base).await {
-        Ok(room) => Ok(room),
+        Ok(room) if room_status(&room.room)? == 2 => Ok(room),
+        Ok(mut snapshot) => {
+            // 状态仍按原规则由当前网页复核；关注分类不应随复核失败而丢失。
+            match fetch_room_from_html(http, id, cookies, base).await {
+                Ok(mut current) => {
+                    if retain_category {
+                        crate::platforms::common::follow_metadata::preserve_douyin_partition(&mut current.room, &snapshot.room);
+                    }
+                    Ok(current)
+                }
+                Err(_) if retain_category => {
+                    // 仅供关注元数据：不发布未经复核的 OFFLINE，不影响播放器原有错误路径。
+                    snapshot.room.as_object_mut().unwrap().remove("status");
+                    Ok(snapshot)
+                }
+                Err(error) => Err(format!("抖音直播状态暂时无法确认：{error}")),
+            }
+        }
         Err((api_error, active_cookie)) => {
-            let page = format!("{base}/{id}");
             let cookies = if active_cookie.is_empty() {
                 cookies
             } else {
                 Some(active_cookie.as_str())
             };
-            let merged = refresh_web_cookie(http, &page, cookies).await;
-            let page_cookie = if merged.is_empty() {
-                cookies
-            } else {
-                Some(merged.as_str())
-            };
-            let fallback = async {
-                let html = http
-                    .get_text_with_headers(&page, Some(request_headers(&page, page_cookie)?))
-                    .await?;
-                parse_room_html(&html)
-            }
-            .await;
-            // 回退失败保留接口原始错误；正常关播数据不会进入回退。
-            fallback.map_err(|_| api_error)
+            fetch_room_from_html(http, id, cookies, base).await.map_err(|_| api_error)
         }
     }
+}
+
+async fn fetch_room_from_html(
+    http: &HttpClient,
+    id: &str,
+    cookies: Option<&str>,
+    base: &str,
+) -> Result<DouyinRoomData, String> {
+    let page = format!("{base}/{id}");
+    let merged = refresh_web_cookie(http, &page, cookies).await;
+    let page_cookie = if merged.is_empty() { cookies } else { Some(merged.as_str()) };
+    // 直接使用平台请求头，避免通用客户端的默认 UA 覆盖抖音浏览器 UA。
+    let html = http.inner.get(&page)
+        .headers(request_headers(&page, page_cookie)?)
+        .timeout(PAGE_TIMEOUT)
+        .send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?
+        .text().await.map_err(|e| e.to_string())?;
+    parse_room_html(&html)
 }
 
 /// 支持稳定 webRid、临时 roomId、直播页链接和链接中的明确房间参数。
@@ -330,14 +370,21 @@ pub async fn fetch_room_data(
     cookies: Option<&str>,
 ) -> Result<DouyinRoomData, String> {
     let id = normalize_douyin_live_id(raw_id);
-    fetch_room_by_id(
+    tokio::time::timeout(ROOM_TIMEOUT, fetch_room_by_id(
         http,
         &id,
         cookies,
         LIVE_BASE,
         "https://webcast.amemv.com/webcast/room/reflow/info/",
-    )
-    .await
+    )).await.map_err(|_| "抖音房间查询超时，请重试".to_string())?
+}
+
+/// 关注和播放复用查询；只在关注路径保留状态未确认时的分类元数据。
+pub async fn fetch_follow_room_data(http: &HttpClient, raw_id: &str, cookies: Option<&str>) -> Result<DouyinRoomData, String> {
+    let id = normalize_douyin_live_id(raw_id);
+    tokio::time::timeout(ROOM_TIMEOUT, fetch_room_by_id_inner(http, &id, cookies, LIVE_BASE,
+        "https://webcast.amemv.com/webcast/room/reflow/info/", true))
+        .await.map_err(|_| "抖音房间查询超时，请重试".to_string())?
 }
 
 async fn fetch_room_by_id(
@@ -347,11 +394,16 @@ async fn fetch_room_by_id(
     live_base: &str,
     reflow_api: &str,
 ) -> Result<DouyinRoomData, String> {
+    fetch_room_by_id_inner(http, id, cookies, live_base, reflow_api, false).await
+}
+
+async fn fetch_room_by_id_inner(http: &HttpClient, id: &str, cookies: Option<&str>, live_base: &str, reflow_api: &str, retain_category: bool) -> Result<DouyinRoomData, String> {
     if id.is_empty() {
         return Err("抖音房间 ID 不能为空".into());
     }
     if id.len() <= 16 {
-        return fetch_room_by_web_rid(http, id, cookies, live_base).await;
+        return if retain_category { fetch_room_by_web_rid_for_follow(http, id, cookies, live_base).await }
+            else { fetch_room_by_web_rid(http, id, cookies, live_base).await };
     }
     // 临时 roomId 通过 reflow 查询，不能传给 web_rid 接口。
     let params = [
@@ -363,12 +415,12 @@ async fn fetch_room_by_id(
         ("app_id", "6383"),
     ];
     let query = serde_urlencoded::to_string(params).map_err(|e| e.to_string())?;
-    let json: Value = http
-        .get_json_with_headers(
-            &format!("{reflow_api}?{query}"),
-            Some(request_headers(live_base, cookies)?),
-        )
-        .await?;
+    let json: Value = http.inner.get(format!("{reflow_api}?{query}"))
+        .headers(request_headers(live_base, cookies)?)
+        .timeout(API_TIMEOUT)
+        .send().await.map_err(|e| e.to_string())?
+        .error_for_status().map_err(|e| e.to_string())?
+        .json().await.map_err(|e| e.to_string())?;
     let room = json
         .pointer("/data/room")
         .filter(|room| room.is_object())
@@ -376,7 +428,8 @@ async fn fetch_room_by_id(
         .ok_or_else(|| "抖音 reflow 接口未返回有效房间数据".to_string())?;
     if room_status(&room)? == 4 {
         if let Some(web_rid) = room_web_rid(&room) {
-            return fetch_room_by_web_rid(http, &web_rid, cookies, live_base).await;
+            return if retain_category { fetch_room_by_web_rid_for_follow(http, &web_rid, cookies, live_base).await }
+                else { fetch_room_by_web_rid(http, &web_rid, cookies, live_base).await };
         }
     }
     Ok(DouyinRoomData { room })
@@ -841,6 +894,13 @@ mod tests {
     fn serve(
         responses: Vec<(u16, &str, String)>,
     ) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        serve_with_initial_delay(responses, Duration::ZERO)
+    }
+
+    fn serve_with_initial_delay(
+        responses: Vec<(u16, &str, String)>,
+        initial_delay: Duration,
+    ) -> (String, std::thread::JoinHandle<Vec<String>>) {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::time::{Duration, Instant};
@@ -859,7 +919,8 @@ mod tests {
                     match listener.accept() {
                         Ok((socket, _)) => break socket,
                         Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                            if start.elapsed() > Duration::from_secs(3) {
+                            let accept_timeout = if initial_delay.is_zero() { 3 } else { 6 };
+                            if start.elapsed() > Duration::from_secs(accept_timeout) {
                                 return requests;
                             }
                             std::thread::sleep(Duration::from_millis(5));
@@ -885,7 +946,15 @@ mod tests {
                 }
                 requests.push(String::from_utf8(request).unwrap());
                 let response = format!("HTTP/1.1 {code} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n{extra}\r\n{body}", body.len());
-                socket.write_all(response.as_bytes()).unwrap();
+                if requests.len() == 1 && !initial_delay.is_zero() {
+                    // 第一条接口挂起时，网页仍可独立响应，模拟实际服务。
+                    std::thread::spawn(move || {
+                        std::thread::sleep(initial_delay);
+                        let _ = socket.write_all(response.as_bytes());
+                    });
+                } else {
+                    socket.write_all(response.as_bytes()).unwrap();
+                }
             }
             requests
         });
@@ -898,8 +967,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn 关播房间只请求一次且保留主播元数据() {
-        let (base, server) = serve(vec![(200, "", api_room(4))]);
+    async fn 主接口挂起时及时回退网页而非等待45秒() {
+        let (base, server) = serve_with_initial_delay(vec![
+            (200, "", api_room(2)),
+            (200, "", String::new()),
+            (200, "", room_page("pace")),
+        ], Duration::from_millis(3500));
+        let start = std::time::Instant::now();
+        let room = fetch_room_by_web_rid(&HttpClient::new_direct_connection().unwrap(), "123456", None, &base)
+            .await.unwrap().room;
+        assert_eq!(room["status"], 2);
+        assert!(start.elapsed() < Duration::from_secs(5));
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].starts_with("GET /123456 "));
+    }
+
+    #[tokio::test]
+    async fn 接口旧关播状态必须由当前网页复核() {
+        let (base, server) = serve(vec![
+            (200, "", api_room(4)),
+            (200, "", String::new()),
+            (200, "", room_page("pace")),
+        ]);
+        let room = fetch_room_by_web_rid(&HttpClient::new_direct_connection().unwrap(), "123456", None, &base)
+            .await.unwrap().room;
+        assert_eq!(room["status"], 2);
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 3);
+        assert!(requests[2].to_lowercase().contains(&format!("user-agent: {}", DEFAULT_USER_AGENT.to_lowercase())));
+    }
+
+    #[tokio::test]
+    async fn 无法复核旧关播数据时不能确定未直播() {
+        let (base, server) = serve(vec![
+            (200, "", api_room(4)),
+            (200, "", String::new()),
+            (200, "", "<html>captcha</html>".into()),
+        ]);
+        let result = fetch_room_by_web_rid(&HttpClient::new_direct_connection().unwrap(), "123456", None, &base).await;
+        assert!(result.is_err());
+        assert_eq!(server.join().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn 当前网页也确认关播才返回关播状态() {
+        let offline_page = room_page("pace").replace("\\\"status\\\":2", "\\\"status\\\":4");
+        assert_eq!(parse_room_html(&offline_page).unwrap().room["status"], 4);
+        let (base, server) = serve(vec![
+            (200, "", api_room(4)), (200, "", String::new()), (200, "", offline_page),
+        ]);
         let room = fetch_room_by_web_rid(
             &HttpClient::new_direct_connection().unwrap(),
             "123456",
@@ -911,7 +1028,7 @@ mod tests {
         .room;
         assert_eq!(room["status"], 4);
         assert_eq!(room["anchor"]["nickname"], "离线主播");
-        assert_eq!(server.join().unwrap().len(), 1);
+        assert_eq!(server.join().unwrap().len(), 3);
     }
 
     #[tokio::test]
@@ -1060,5 +1177,91 @@ mod tests {
             choose_flv_stream(&room, "UHD"),
             Some(("uhd".into(), "https://example.com/uhd.flv".into()))
         );
+    }
+
+    fn parity_path(deep: bool) -> Value {
+        let mut path = json!({"partition":{"id_str":"103","type":4,"title":"游戏"},
+            "sub_partition":{"partition":{"id_str":"1","type":1,"title":"射击游戏"}}});
+        if deep {
+            path["sub_partition"]["sub_partition"] = json!({"partition":{"id_str":"1010032","type":1,"title":"和平精英"}});
+        }
+        path
+    }
+
+    #[tokio::test]
+    async fn parity_api_preserves_sibling_partition_for_live_and_offline_without_extra_requests() {
+        for status in [2,4] {
+            let body = json!({"data":{"data":[{"status":status,"partition_road_map":parity_path(false)}],
+                "partition_road_map":parity_path(true)}}).to_string();
+            let (base, server) = serve(vec![(200,"",body)]);
+            let data = request_api_room(&HttpClient::new_direct_connection().unwrap(),
+                &format!("{base}/api"),&base,None).await.unwrap();
+            let metadata = crate::platforms::common::follow_metadata::douyin_metadata(&data.room,None);
+            assert_eq!(metadata.category_name.as_deref(),Some("和平精英"));
+            assert_eq!(metadata.category_id.as_deref(),Some("1010032,1"));
+            assert_eq!(data.room["status"],status);
+            assert_eq!(server.join().unwrap().len(),1);
+        }
+    }
+
+    #[test]
+    fn parity_html_keeps_deeper_of_room_and_room_info_partition_for_both_statuses() {
+        for status in [2,4] {
+            for room_deeper in [false,true] {
+                let state = json!({"state":{"roomStore":{"roomInfo":{
+                    "room":{"status":status,"partition_road_map":parity_path(room_deeper)},
+                    "anchor":{"nickname":"不从此处猜分类"},
+                    "partition_road_map":parity_path(!room_deeper)
+                }}}});
+                let page = format!("<script>self.__pace_f.push([1,{}])</script>",
+                    serde_json::to_string(&format!("7:{state}\n")).unwrap());
+                let data = parse_room_html(&page).unwrap();
+                let metadata = crate::platforms::common::follow_metadata::douyin_metadata(&data.room,None);
+                assert_eq!(metadata.category_name.as_deref(),Some("和平精英"));
+                assert_eq!(metadata.category_id.as_deref(),Some("1010032,1"));
+                assert_eq!(data.room["status"],status);
+                assert_eq!(data.room["anchor"]["nickname"],"不从此处猜分类");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn parity_offline_id_only_sibling_path_resolves_official_directory() {
+        let mut path = parity_path(true);
+        path["sub_partition"]["sub_partition"]["partition"].as_object_mut().unwrap().remove("title");
+        let state = json!({"state":{"roomStore":{"roomInfo":{"room":{"status":4},"partition_road_map":path}}}});
+        let page = format!("<script>self.__next_f.push([1,{}])</script>",
+            serde_json::to_string(&format!("7:{state}\n")).unwrap());
+        let data = parse_room_html(&page).unwrap();
+        let cache = crate::platforms::common::follow_metadata::DirectoryCache::default();
+        let result = crate::platforms::douyin::follow_category::metadata_with_directory(&data.room,&cache,||async {
+            Ok(std::collections::HashMap::from([("1010032,1".into(),"和平精英".into())]))
+        }).await;
+        assert_eq!(result.category_name.as_deref(),Some("和平精英"));
+        assert_eq!(result.category_id.as_deref(),Some("1010032,1"));
+        assert_eq!(data.room["status"],4);
+    }
+
+    #[tokio::test]
+    async fn follow_category_survives_html_status_verification_failure_without_false_offline() {
+        let body = json!({"data":{"data":[{"status":4}],"partition_road_map":parity_path(true)}}).to_string();
+        let (base, server) = serve(vec![(200,"",body),(444,"","".into()),(444,"","".into())]);
+        let result = fetch_room_by_web_rid_for_follow(&HttpClient::new_direct_connection().unwrap(),"123",None,&base).await.unwrap();
+        let metadata = crate::platforms::common::follow_metadata::douyin_metadata(&result.room,None);
+        assert_eq!(metadata.category_name.as_deref(),Some("和平精英"));
+        assert!(result.room.get("status").is_none_or(Value::is_null));
+        assert_eq!(server.join().unwrap().len(),3);
+    }
+
+    #[tokio::test]
+    async fn follow_category_retains_api_path_when_verified_html_omits_it() {
+        let api = json!({"data":{"data":[{"status":4}],"partition_road_map":parity_path(true)}}).to_string();
+        let state = json!({"state":{"roomStore":{"roomInfo":{"room":{"status":4}}}}});
+        let page = format!("<script>self.__next_f.push([1,{}])</script>",serde_json::to_string(&format!("7:{state}\n")).unwrap());
+        let (base, server) = serve(vec![(200,"",api),(200,"",page.clone()),(200,"",page)]);
+        let result = fetch_room_by_web_rid_for_follow(&HttpClient::new_direct_connection().unwrap(),"123",None,&base).await.unwrap();
+        assert_eq!(result.room["status"],4);
+        assert_eq!(crate::platforms::common::follow_metadata::douyin_metadata(&result.room,None).category_name.as_deref(),Some("和平精英"));
+        assert_eq!(server.join().unwrap().len(),3);
     }
 }

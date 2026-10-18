@@ -1,5 +1,8 @@
 "use client";
 
+import { normalizeFollowCategory, reconcileFollowMetadata, stripFollowRuntime } from "../state/follow/followGrouping";
+import type { FollowedStreamer, FollowFolder, FollowListItem, Platform as FollowPlatform } from "../state/follow/FollowProvider";
+
 export const LAN_SYNC_KIND = "dtv-lan-sync" as const;
 export const LAN_SYNC_VERSION = 1 as const;
 
@@ -91,9 +94,24 @@ export function collectLanSyncEntries(storage: Storage): PortableEntries {
   const entries: PortableEntries = {};
   LAN_SYNC_KEYS.forEach((key) => {
     const value = storage.getItem(key);
-    if (typeof value === "string") entries[key] = value;
+    if (typeof value === "string") entries[key] = sanitizeFollowEntry(key, value);
   });
   return entries;
+}
+
+function sanitizeFollowEntry(key: string, value: string): string {
+  if (key !== "followedStreamers" && key !== "followListOrder") return value;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    if (!Array.isArray(parsed)) return value;
+    return JSON.stringify(parsed.map((entry) => {
+      if (!isRecord(entry)) return entry;
+      if (key === "followedStreamers") return stripFollowRuntime(entry);
+      return entry.type === "streamer" && isRecord(entry.data) ? { ...entry, data: stripFollowRuntime(entry.data) } : entry;
+    }));
+  } catch {
+    return value;
+  }
 }
 
 export function createLanSyncPayload(storage: Storage, source: Partial<ConfigSource> = {}): LanSyncPayload {
@@ -160,7 +178,7 @@ export function parseLanSyncPayload(raw: unknown): LanSyncPayload {
   Object.entries(raw.entries).forEach(([key, value]) => {
     if (!LAN_SYNC_KEYS.includes(key as LanSyncKey)) return;
     if (typeof value !== "string") return;
-    entries[key] = value;
+    entries[key] = sanitizeFollowEntry(key, value);
   });
 
   return {
@@ -174,27 +192,6 @@ export function parseLanSyncPayload(raw: unknown): LanSyncPayload {
     entries
   };
 }
-
-type FollowPlatform = "DOUYU" | "DOUYIN" | "HUYA" | "BILIBILI" | "TWITCH";
-
-type FollowedStreamer = {
-  id: string;
-  platform: FollowPlatform;
-  nickname: string;
-  avatarUrl: string;
-  roomTitle?: string;
-  currentRoomId: string;
-  liveStatus: "UNKNOWN" | "LIVE" | "OFFLINE";
-};
-
-type FollowFolder = {
-  id: string;
-  name: string;
-  streamerIds: string[];
-  expanded?: boolean;
-};
-
-type FollowListItem = { type: "folder"; data: FollowFolder } | { type: "streamer"; data: FollowedStreamer };
 
 function normalizeStreamerKey(streamerKey: string) {
   const [rawPlatform, rawId] = String(streamerKey || "").split(":");
@@ -268,7 +265,13 @@ export function applyIncrementalLanSyncImport(storage: Storage, remoteEntries: P
   const streamerByKey = new Map<string, FollowedStreamer>();
   for (const s of localFollowed) {
     if (!s?.platform || !s?.id) continue;
-    streamerByKey.set(`${s.platform}:${s.id}`, s);
+    streamerByKey.set(`${s.platform}:${s.id}`, reconcileFollowMetadata(s, {}));
+  }
+  // 旧客户端可能只在顺序条目中保留完整元数据，先恢复本地分类缓存。
+  for (const item of localOrder) {
+    if (item?.type !== "streamer" || !item.data?.platform || !item.data?.id) continue;
+    const key = `${item.data.platform}:${item.data.id}`;
+    streamerByKey.set(key, reconcileFollowMetadata(item.data, streamerByKey.get(key) ?? {}));
   }
 
   const addStreamerIfMissing = (platform: string, id: string, streamer?: Partial<FollowedStreamer>) => {
@@ -277,8 +280,14 @@ export function applyIncrementalLanSyncImport(storage: Storage, remoteEntries: P
     const sid = String(id || "");
     if (!sid) return;
     const key = `${p}:${sid}`;
-    if (streamerByKey.has(key)) return;
-    streamerByKey.set(key, {
+    const existing = streamerByKey.get(key);
+    if (existing) {
+      if (normalizeFollowCategory(existing.categoryName) === "其他" && normalizeFollowCategory(streamer?.categoryName) !== "其他") {
+        streamerByKey.set(key, reconcileFollowMetadata(existing, { categoryName: streamer?.categoryName, categoryId: streamer?.categoryId }));
+      }
+      return;
+    }
+    const added: FollowedStreamer = {
       id: sid,
       platform: p,
       nickname: streamer?.nickname ?? sid,
@@ -286,7 +295,8 @@ export function applyIncrementalLanSyncImport(storage: Storage, remoteEntries: P
       roomTitle: streamer?.roomTitle ?? "",
       currentRoomId: streamer?.currentRoomId ?? sid,
       liveStatus: streamer?.liveStatus ?? "UNKNOWN"
-    });
+    };
+    streamerByKey.set(key, reconcileFollowMetadata(added, { categoryName: streamer?.categoryName, categoryId: streamer?.categoryId }));
     addedStreamers += 1;
   };
 
@@ -420,7 +430,7 @@ export function applyIncrementalLanSyncImport(storage: Storage, remoteEntries: P
     if (folderedKeys.has(key) || streamerKeysInOrder.has(key)) continue;
     streamerKeysInOrder.add(key);
     const merged = streamerByKey.get(`${String(s.platform).toUpperCase()}:${String(s.id)}`);
-    updatedStreamerItems.push({ type: "streamer", data: merged ?? s });
+    updatedStreamerItems.push({ type: "streamer", data: stripFollowRuntime(merged ?? s) });
   }
   for (const s of mergedStreamers) {
     const key = normalizeStreamerKey(`${s.platform}:${s.id}`).key;

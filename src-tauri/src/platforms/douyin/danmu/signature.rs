@@ -1,7 +1,7 @@
 use deno_core::{FastString, JsRuntime, RuntimeOptions};
 use log::{debug, error};
 use md5::{Digest, Md5};
-use rand::Rng;
+use rand::RngExt;
 use std::collections::HashMap;
 #[cfg(target_os = "linux")]
 use std::sync::Once;
@@ -59,7 +59,7 @@ pub async fn generate_signature(
     let mut hasher = Md5::new();
     hasher.update(to_sign_str.as_bytes());
     let digest_bytes = hasher.finalize();
-    let md5_param = format!("{:x}", digest_bytes);
+    let md5_param = hex::encode(digest_bytes);
     debug!("[Douyin Danmaku] MD5 param for signature: {}", md5_param);
 
     ensure_js_runtime_platform_initialized();
@@ -98,7 +98,7 @@ pub async fn generate_signature(
             e
         })?;
 
-    let scope = &mut runtime.handle_scope();
+    deno_core::scope!(scope, runtime);
     let local_value = deno_core::v8::Local::new(scope, result);
 
     if local_value.is_string() {
@@ -115,10 +115,10 @@ pub async fn generate_signature(
 
 pub fn generate_ms_token(length: usize) -> String {
     const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"; // Removed _= as they are not typical for msToken
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..length)
         .map(|_| {
-            let idx = rng.gen_range(0..CHARSET.len());
+            let idx = rng.random_range(0..CHARSET.len());
             CHARSET[idx] as char
         })
         .collect()
@@ -129,6 +129,32 @@ pub fn generate_douyin_ms_token() -> String {
     // For now, let's assume msToken length is always 107, as used elsewhere.
     // If variable length is needed, this command could take a length parameter.
     generate_ms_token(107)
+}
+
+#[cfg(test)]
+mod upgrade_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn embedded_douyin_signer_survives_v8_upgrade() {
+        let signature = generate_signature(
+            "wss://webcast5-ws-web-lq.douyin.com/webcast/im/push/v2/?live_id=1&aid=6383&room_id=123&user_unique_id=456&device_platform=web&identity=audience",
+        ).await.unwrap();
+        assert!(!signature.is_empty());
+        assert!(signature.is_ascii());
+        assert!(!signature.contains(char::is_whitespace));
+        assert_ne!(signature, "undefined");
+    }
+
+    #[test]
+    fn upgraded_rand_preserves_ms_token_format() {
+        assert_eq!(generate_ms_token(0), "");
+        for length in [1, 107] {
+            let token = generate_ms_token(length);
+            assert_eq!(token.len(), length);
+            assert!(token.bytes().all(|byte| byte.is_ascii_alphanumeric()));
+        }
+    }
 }
 
 // Placeholder for the more complex signature generation if needed later.

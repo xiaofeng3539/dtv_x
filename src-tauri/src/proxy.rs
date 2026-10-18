@@ -145,13 +145,23 @@ async fn image_proxy_handler(
     }
 }
 
-// Your actual proxy logic - this is a simplified placeholder
+#[derive(Deserialize)]
+struct FlvQuery {
+    url: Option<String>,
+}
+
+// 播放 URL 自带不可变来源，切台时不再读取被旧请求改写的全局地址。
 async fn flv_proxy_handler(
     _req: HttpRequest,
     stream_url_store: web::Data<StreamUrlStore>,
     client: web::Data<LiveHttpClient>,
+    query: web::Query<FlvQuery>,
 ) -> impl Responder {
-    let url = stream_url_store.url.lock().unwrap().clone();
+    let url = match query.url.as_deref() {
+        Some(url) if url.starts_with("http://") || url.starts_with("https://") => url.to_string(),
+        Some(_) => return HttpResponse::BadRequest().body("invalid stream URL"),
+        None => stream_url_store.url.lock().unwrap().clone(),
+    };
     if url.is_empty() {
         return HttpResponse::NotFound().body("Stream URL is not set or empty.");
     }
@@ -407,113 +417,20 @@ async fn hls_proxy_handler(
 
 #[tauri::command]
 pub async fn start_proxy(
-    _app_handle: AppHandle,
-    server_handle_state: State<'_, ProxyServerHandle>,
+    app_handle: AppHandle,
+    _server_handle_state: State<'_, ProxyServerHandle>,
     stream_url_store: State<'_, StreamUrlStore>,
+    url: Option<String>,
 ) -> Result<String, String> {
-    // ★ 自己先 bind 一个由系统分配端口的 listener，这样在交给 actix 之前
-    //   就确定了端口号（既能填进返回的 URL，也能在冲突时换端口重试）。
-    let (listener, bound_port) = bind_loopback_listener().map_err(|e| {
-        let msg = format!("[Rust/proxy.rs] 无法绑定本地代理端口: {}", e);
-        eprintln!("{}", msg);
-        msg
-    })?;
-    let current_stream_url = stream_url_store.url.lock().unwrap().clone();
-
-    if current_stream_url.is_empty() {
-        return Err("Stream URL is not set in store. Cannot start proxy.".to_string());
+    let upstream = url.unwrap_or_else(|| stream_url_store.url.lock().unwrap().clone());
+    let parsed = Url::parse(&upstream).map_err(|e| format!("Invalid stream URL: {}", e))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err("Invalid stream URL scheme".to_string());
     }
-
-    // stream_url_data_for_actix can be created once and cloned, as StreamUrlStore is Arc based and Send + Sync
-    let stream_url_data_for_actix = web::Data::new(stream_url_store.inner().clone());
-    // REMOVED: let awc_client_for_actix = web::Data::new(Client::default());
-
-    // Ensure MutexGuard is dropped before .await
-    let existing_handle_to_stop = { server_handle_state.0.lock().unwrap().take() };
-    if let Some(existing_handle) = existing_handle_to_stop {
-        existing_handle.stop(false).await;
-    }
-
-    let server = HttpServer::new(move || {
-        let app_data_stream_url = stream_url_data_for_actix.clone();
-        // Create reqwest::Client inside the closure for each worker thread (for images)
-        let app_data_reqwest_client = web::Data::new(
-            Client::builder()
-                .no_proxy()
-                .http1_only()
-                .gzip(false)
-                .brotli(false)
-                .no_deflate()
-                // 池空闲连接要设上限：设为None 会让空闲连接永久驻留，
-                // 长期浏览时白白占用 socket 与内存。
-                .pool_idle_timeout(Some(Duration::from_secs(30)))
-                .pool_max_idle_per_host(4)
-                .tcp_keepalive(Duration::from_secs(60))
-                // ★ 这里是「图片」专用 client，绝不能设 7200s（2 小时）。
-                //   图片代理与 FLV/HLS 转发共用同一个 actix HttpServer，
-                //   而 actix 的 worker 数= CPU 核数，是**共享**的。
-                //   列表滚动一次就能并发几十个 /image 请求，只要上游 CDN 挂住，
-                //   每个请求会占住一个 worker 长达 2 小时 —— 几十个就足以耗尽 worker 池，
-                //   /live.flv 与 /hls 跟着一起卡死，表现为「看直播突然整个画面冻住」。
-                //   图片是小资源，20s 拿不到就是失败，重试成本远低于拖垮播放。
-                .timeout(Duration::from_secs(20))
-                .build()
-                .expect("failed to build client"),
-        );
-        let app_data_live_client = web::Data::new(LiveHttpClient(live_http::live_client()));
-        // 走系统代理的客户端（Twitch 等海外平台回源用）
-        let app_data_system_client = web::Data::new(SystemProxyHttpClient(
-            Client::builder()
-                .http1_only()
-                .pool_max_idle_per_host(8)
-                .tcp_keepalive(Duration::from_secs(60))
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("failed to build system proxy client"),
-        ));
-        App::new()
-            .app_data(app_data_stream_url)
-            .app_data(app_data_reqwest_client)
-            .app_data(app_data_live_client)
-            .app_data(app_data_system_client)
-            .wrap(actix_cors::Cors::permissive())
-            .route("/live.flv", web::get().to(flv_proxy_handler))
-            .route("/image", web::get().to(image_proxy_handler))
-            .route("/hls", web::get().to(hls_proxy_handler))
-    })
-    .keep_alive(Duration::from_secs(120))
-    // 用 listen() 复用上面自己 bind 的 listener —— 端口已在前面确定，
-    // 不再让 actix 二次 bind。
-    //
-    // API 说明（actix-web 4，已核对官方文档）：
-    //   listen() -> io::Result<HttpServer>，run() -> Server（可 await）。
-    //   原代码的 .bind(..)?.run() 本来是对的，此前误删 .run() 导致 E0599/E0308。
-    .listen(listener)
-    .map_err(|e| {
-        let msg = format!(
-            "[Rust/proxy.rs] Failed to listen on port {}: {}",
-            bound_port, e
-        );
-        eprintln!("{}", msg);
-        msg
-    })?
-    // ★ HttpServer -> Server：run() 才开始监听并返回可 await 的 Server
-    .run();
-
-    let server_handle_for_state = server.handle();
-    *server_handle_state.0.lock().unwrap() = Some(server_handle_for_state);
-
-    // Use tauri::async_runtime::spawn directly
-    tauri::async_runtime::spawn(async move {
-        if let Err(e) = server.await {
-            eprintln!("[Rust/proxy.rs] Proxy server run error: {}", e);
-        } else {
-            println!("[Rust/proxy.rs] Proxy server on port {} shut down.", bound_port);
-        }
-    });
-
-    let proxy_url = format!("http://127.0.0.1:{}/live.flv", bound_port);
-    Ok(proxy_url)
+    // 对齐 Simple Live 的 Media(url) 生命周期：共享传输服务，每条媒体地址独立。
+    // 不为每次刷新/切台重建一套 HTTP worker，也不由旧房间的 stop 关闭新房间代理。
+    let base = start_static_proxy_server(app_handle, stream_url_store).await?;
+    Ok(format!("{}/live.flv?url={}", base, urlencoding::encode(&upstream)))
 }
 
 #[tauri::command]
@@ -534,8 +451,10 @@ pub async fn start_static_proxy_server(
     //   2) 端口交给操作系统分配（bind_loopback_listener），从根上避开端口冲突。
 
     // 幂等：只有「本进程确实启动过静态代理」才直接复用。
-    if let Some(existing) = static_proxy_base_cell().lock().unwrap().clone() {
-        return Ok(existing);
+    // 启动过程没有 await；持锁直到记录 base，避免首次并发调用创建重复服务。
+    let mut shared_base = static_proxy_base_cell().lock().unwrap();
+    if let Some(existing) = shared_base.as_ref() {
+        return Ok(existing.clone());
     }
 
     // 系统分配端口，既不会与其它程序冲突，也不需要维护候选端口列表。
@@ -606,7 +525,7 @@ pub async fn start_static_proxy_server(
 
     let base = format!("http://127.0.0.1:{}", bound_port);
     // 记录真实 base，供后续幂等调用复用
-    *static_proxy_base_cell().lock().unwrap() = Some(base.clone());
+    *shared_base = Some(base.clone());
 
     // Do NOT overwrite the main proxy server handle; run static proxy independently
     tauri::async_runtime::spawn(async move {
@@ -632,4 +551,75 @@ pub async fn stop_proxy(server_handle_state: State<'_, ProxyServerHandle>) -> Re
         println!("[Rust/proxy.rs] stop_proxy command: No proxy server was running or handle already taken.");
     }
     Ok(())
+}
+
+
+#[cfg(test)]
+mod playback_session_tests {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[actix_web::test]
+    async fn switching_flv_urls_keeps_each_request_bound_to_its_own_stream() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let upstream = tokio::spawn(async move {
+            for expected in ["/first.flv", "/second.flv"] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0u8; 4096];
+                let count = socket.read(&mut request).await.unwrap();
+                let request = String::from_utf8_lossy(&request[..count]);
+                assert!(request.starts_with(&format!("GET {} ", expected)));
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", expected.len(), expected);
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        let store = StreamUrlStore::default();
+        let app = actix_web::test::init_service(App::new()
+            .app_data(web::Data::new(store.clone()))
+            .app_data(web::Data::new(LiveHttpClient(live_http::live_client())))
+            .route("/live.flv", web::get().to(flv_proxy_handler))).await;
+        for path in ["/first.flv", "/second.flv"] {
+            // 全局旧房间地址即使被迟到请求改写，也不应改变当前 URL 的来源。
+            *store.url.lock().unwrap() = "http://127.0.0.1:1/stale.flv".into();
+            let url = format!("http://127.0.0.1:{}{}", port, path);
+            let request = actix_web::test::TestRequest::get()
+                .uri(&format!("/live.flv?url={}", urlencoding::encode(&url))).to_request();
+            let response = actix_web::test::call_service(&app, request).await;
+            assert!(response.status().is_success(), "request must use its own URL, not the shared store");
+            let body = actix_web::test::read_body(response).await;
+            assert_eq!(body.as_ref(), path.as_bytes());
+        }
+        upstream.await.unwrap();
+    }
+
+    #[actix_web::test]
+    async fn closing_playback_drops_the_upstream_connection() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (closed_tx, closed_rx) = tokio::sync::oneshot::channel();
+        let upstream = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 4096];
+            let _ = socket.read(&mut request).await.unwrap();
+            socket.write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n3\r\nFLV\r\n").await.unwrap();
+            let mut byte = [0u8; 1];
+            let result = socket.read(&mut byte).await;
+            let _ = closed_tx.send(matches!(result, Ok(0)) || result.is_err());
+        });
+        let app = actix_web::test::init_service(App::new()
+            .app_data(web::Data::new(StreamUrlStore::default()))
+            .app_data(web::Data::new(LiveHttpClient(live_http::live_client())))
+            .route("/live.flv", web::get().to(flv_proxy_handler))).await;
+        let url = format!("http://127.0.0.1:{}/live.flv", port);
+        let request = actix_web::test::TestRequest::get()
+            .uri(&format!("/live.flv?url={}", urlencoding::encode(&url))).to_request();
+        let response = actix_web::test::call_service(&app, request).await;
+        assert!(response.status().is_success());
+        drop(response);
+        assert!(tokio::time::timeout(Duration::from_secs(2), closed_rx).await.unwrap().unwrap(),
+            "关闭媒体响应后应释放持续收流连接，而不是等应用退出");
+        upstream.await.unwrap();
+    }
+
 }

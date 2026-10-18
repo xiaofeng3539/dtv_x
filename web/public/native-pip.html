@@ -1,0 +1,17 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+html,body{margin:0;width:100%;height:100%;background:transparent;color:#fff;font:14px system-ui;overflow:hidden}body{border:1px solid #ffffff35;box-sizing:border-box}header,footer{position:absolute;left:0;right:0;display:flex;align-items:center;padding:8px;background:#101217b8;transition:opacity .2s;z-index:2}header{top:0;justify-content:space-between}footer{bottom:0;justify-content:center}button{border:0;background:transparent;color:inherit;padding:5px 10px;font:inherit;cursor:pointer}button:hover{background:#ffffff25;border-radius:4px}body:not(:hover) header,body:not(:hover) footer{opacity:0}#error{display:none;position:absolute;inset:0;background:#111c;align-content:center;text-align:center;padding:30px}
+</style><header><span id="drag">DTV 画中画</span><span><button id="back" title="返回主窗口">↗</button><button id="close" title="退出画中画">✕</button></span></header><footer><button id="pause" title="播放／暂停">暂停</button><button id="mute" title="静音">静音</button></footer><div id="error"></div>
+<script>
+(()=>{
+ const call=(command,args)=>window.__TAURI_INTERNALS__.invoke(command,args);let state={generation:0,paused:false,muted:false};
+ const error=e=>{const el=document.getElementById('error');el.style.display='block';el.textContent=String(e);};
+ const control=(command,args)=>call(command,{generation:state.generation,...args}).catch(error);
+ document.getElementById('pause').onclick=()=>control('native_player_pause',{paused:!state.paused});
+ document.getElementById('mute').onclick=()=>control('native_player_muted',{muted:!state.muted});
+ const exit=()=>control('native_player_pip',{enabled:false});document.getElementById('back').onclick=exit;document.getElementById('close').onclick=exit;
+ document.querySelector('header').onpointerdown=e=>{if(!e.target.closest('button'))call('plugin:window|start_dragging',{label:'native-pip'}).catch(error);};
+ document.addEventListener('keydown',e=>{if(e.code==='Space'){e.preventDefault();control('native_player_pause',{paused:!state.paused});}if(e.code==='Escape')exit();});
+ setInterval(async()=>{try{state=await call('native_player_snapshot');document.getElementById('pause').textContent=state.paused?'播放':'暂停';document.getElementById('mute').textContent=state.muted?'取消静音':'静音';}catch(e){error(e);}},200);
+})();
+</script></html>

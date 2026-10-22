@@ -5,7 +5,8 @@ const path = require('node:path');
 const vm = require('node:vm');
 const ts = require('typescript-api');
 
-const source = fs.readFileSync(path.join(__dirname, '../src/components/follows/FollowsList.tsx'), 'utf8');
+const refreshFile = path.join(__dirname, '../src/state/follow/FollowRefreshProvider.tsx');
+const source = fs.readFileSync(fs.existsSync(refreshFile) ? refreshFile : path.join(__dirname, '../src/components/follows/FollowsList.tsx'), 'utf8');
 const tree = ts.createSourceFile('follows.tsx', source, ts.ScriptTarget.Latest, true, ts.ScriptKind.TSX);
 let callback;
 function visit(node) {
@@ -13,18 +14,18 @@ function visit(node) {
   ts.forEachChild(node, visit);
 }
 visit(tree);
-const top = source.slice(source.indexOf('const FOLLOW_REFRESH_CONCURRENCY'), source.indexOf('export function FollowsList'));
+const top = source.slice(source.indexOf('const FOLLOW_REFRESH_CONCURRENCY'), source.indexOf('export function FollowRefreshProvider') > 0 ? source.indexOf('export function FollowRefreshProvider') : source.indexOf('export function FollowsList'));
 const code = ts.transpileModule(`${top}\nexport const run = ${callback}; export { refreshOne };`, {
   compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
 }).outputText;
 
-function setup(streamers, query, cores = 2) {
+function setup(streamers, query, cores = 2, concurrency = 0) {
   const calls = [], patches = [], timers = new Map();
   let sequence = 0;
   const exports = {};
   const aliveRef = { current: true }, lock = { current: false };
   const progress = { current: 0, total: 0, refreshing: false };
-  const context = { exports, console, navigator: { hardwareConcurrency: cores },
+  const context = { exports, console, settings: { followRefreshConcurrency: concurrency }, navigator: { hardwareConcurrency: cores },
     window: { setTimeout: (fn, ms) => { timers.set(++sequence, { fn, ms }); return sequence; }, clearTimeout: (id) => timers.delete(id) },
     invoke: async (command, args) => { calls.push({ command, args }); return query(command, args); },
     follow: { followedStreamers: streamers, updateStreamers: (items) => patches.push(...items) },
@@ -75,7 +76,7 @@ test('慢房间不会阻止已完成结果显示，失败保持原状态', async
   assert.equal(run.patches.find((item) => item.id === '快')?.patch.liveStatus, 'LIVE');
   resolve({ is_live: false });
   await pending;
-  assert.equal(run.patches.some((item) => item.id === '失败'), false);
+  assert.equal(run.patches.find((item) => item.id === '失败').patch.liveStatus, 'UNKNOWN');
 });
 
 test('虎牙状态刷新仅取元信息，保留昵称头像和标题', async () => {
@@ -164,8 +165,8 @@ test('元信息缺失直播状态不误判为未开播', async () => {
 test('刷新只写回主播数据，不调用列表重排（游戏分组只是视图）', async () => {
   const run = setup([streamer('HUYA', 'a', 'OFFLINE'), streamer('HUYA', 'b', 'LIVE')], () => ({ is_live: true }));
   await run.exports.run();
-  assert.equal(run.patches.length, 1);
-  assert.equal(run.patches[0].id, 'a');
+  assert.equal(run.patches.length, 2);
+  assert.deepEqual(run.patches.map(p => p.id), ['a', 'b']);
 });
 
 
@@ -190,7 +191,7 @@ test('抖音未知状态仍保留有效官方分类而不改写已知直播状�
     const patch = await run.exports.refreshOne(streamer('DOUYIN', '123', 'LIVE'));
     assert.equal(patch.categoryName, '英雄联盟');
     assert.equal(patch.categoryId, '1010014,1');
-    assert.equal(Object.hasOwn(patch, 'liveStatus'), false);
+    assert.equal(patch.liveStatus, 'UNKNOWN');
   }
 });
 
@@ -203,62 +204,104 @@ test('抖音未知状态且无有效官方分类仍不覆盖缓存或伪装离�
 });
 
 
-test('仅查询未开播和未知关注，五个平台已直播数据完全保持不动，进度只计待发现人数', async () => {
-  const live = ['DOUYU','HUYA','BILIBILI','DOUYIN','TWITCH'].map(platform => ({
-    ...streamer(platform, platform, 'LIVE'), categoryName: '英雄联盟', popularity: 99
+const grouping = {};
+vm.runInNewContext(ts.transpileModule(fs.readFileSync(path.join(__dirname, '../src/state/follow/followGrouping.ts'), 'utf8'), {
+  compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
+}).outputText, { exports: grouping });
+function commitPatches(run) {
+  run.follow.followedStreamers = run.follow.followedStreamers.map(s => {
+    const patch = run.patches.find(p => p.platform === s.platform && p.id === s.id)?.patch;
+    return patch ? grouping.mergeFollowMetadata(s, patch) : s;
+  });
+}
+
+test('五平台昨天缓存为直播中的主播，今天刷新确认下播并退出直播筛选，保留分类', async () => {
+  const cached = ['DOUYU','HUYA','BILIBILI','DOUYIN','TWITCH'].map(platform => ({
+    ...streamer(platform, platform, 'LIVE'), categoryName: '英雄联盟', categoryId: 'game', popularity: 99
   }));
-  const pending = [streamer('DOUYU', '新开播'), streamer('HUYA', '未知', 'UNKNOWN'),
-    { ...streamer('TWITCH', '旧数据'), liveStatus: undefined }];
-  const originals = JSON.stringify(live);
-  const run = setup([...live, ...pending], command => command === 'fetch_douyu_room_info'
-    ? { show_status: 1 } : { is_live: true });
+  const run = setup(cached, command => ({
+    fetch_douyu_room_info: { show_status: 2 }, get_huya_unified_cmd: { is_live: false },
+    fetch_bilibili_streamer_info: { status: 0 }, fetch_douyin_streamer_info: { status: 4 },
+    get_twitch_streamer_status: { is_live: false }
+  })[command]);
   await run.exports.run();
-  assert.deepEqual(run.calls.map(c => c.args.roomId ?? c.args.login).sort(), ['新开播','旧数据','未知'].sort());
-  assert.equal(run.patches.length, 3);
-  assert.ok(run.patches.every(p => p.patch.liveStatus === 'LIVE'));
-  assert.equal(run.progress.total, 3);
-  assert.equal(run.progress.current, 3);
+  assert.equal(run.calls.length, 5, '缓存的 LIVE 不应永久跳过状态校验');
+  assert.equal(run.patches.length, 5);
+  commitPatches(run);
+  assert.ok(run.follow.followedStreamers.every(s => s.liveStatus === 'OFFLINE'));
+  assert.ok(run.follow.followedStreamers.every(s => s.categoryName === '英雄联盟' && s.categoryId === 'game'));
+  assert.ok(run.follow.followedStreamers.every(s => !Object.hasOwn(s, 'popularity')));
+  assert.equal(grouping.buildFollowGameGroups(run.follow.followedStreamers, 'ALL', 'LIVE').length, 0);
+  assert.equal(grouping.buildFollowGameGroups(run.follow.followedStreamers, 'ALL', 'OFFLINE')[0].members.length, 5);
+});
+
+test('直播中、未开播、未知和旧状态均校验，不受当前平台或直播筛选影响', async () => {
+  const items = [streamer('HUYA', '正在播', 'LIVE'), streamer('HUYA','刚下播','LIVE'),
+    streamer('DOUYU','刚开播'), streamer('TWITCH','未知','UNKNOWN'),
+    { ...streamer('TWITCH','旧数据'), liveStatus: undefined }];
+  const run = setup(items, (command, args) => command === 'fetch_douyu_room_info'
+    ? { show_status: 1 } : { is_live: args.roomId !== '刚下播' });
+  run.follow.platformFilter = 'DOUYU'; run.follow.statusFilter = 'LIVE';
+  await run.exports.run(); commitPatches(run);
+  assert.equal(run.calls.length, 5);
+  assert.equal(run.follow.followedStreamers.find(s => s.id === '刚下播').liveStatus, 'OFFLINE');
+  assert.equal(run.follow.followedStreamers.find(s => s.id === '刚开播').liveStatus, 'LIVE');
+  assert.equal(run.progress.total, 5); assert.equal(run.progress.current, 5);
   assert.equal(run.progress.refreshing, false);
-  assert.equal(JSON.stringify(live), originals);
-  assert.ok(run.follow.followedStreamers.slice(0,5).every((s,i) => s === live[i]));
+  assert.equal(run.follow.platformFilter, 'DOUYU'); assert.equal(run.follow.statusFilter, 'LIVE');
+  assert.deepEqual(run.follow.followedStreamers.map(s => s.id), items.map(s => s.id));
 });
 
-test('空关注或全部已直播时不发请求、不占刷新锁、不启动看门狗', async () => {
-  for (const streamers of [[], [streamer('HUYA','已直播','LIVE')]]) {
-    const run = setup(streamers, () => { throw Error('不应查询已直播主播'); });
-    await run.exports.run(); await run.exports.run();
-    assert.equal(run.calls.length, 0); assert.equal(run.patches.length, 0);
-    assert.equal(run.lock.current, false); assert.equal(run.progress.refreshing, false);
-    assert.equal(run.timers.size, 0);
-  }
+test('空关注不发请求、不占刷新锁、不启动看门狗', async () => {
+  const run = setup([], () => { throw Error('空关注不应查询'); });
+  await run.exports.run(); await run.exports.run();
+  assert.equal(run.calls.length, 0); assert.equal(run.patches.length, 0);
+  assert.equal(run.lock.current, false); assert.equal(run.progress.refreshing, false);
+  assert.equal(run.timers.size, 0);
 });
 
-test('新发现开播后加入直播数据，下一轮只继续查询仍未开播的主播', async () => {
-  const run = setup([streamer('DOUYU','新开播'), streamer('HUYA','仍离线')], command =>
-    command === 'fetch_douyu_room_info' ? { show_status: 1 } : { is_live: false });
-  await run.exports.run();
-  // Provider owns immutable updates; feed its committed snapshot into the next invocation.
-  run.follow.followedStreamers = run.follow.followedStreamers.map(s => ({ ...s,
-    ...run.patches.find(p => p.platform === s.platform && p.id === s.id)?.patch }));
-  assert.equal(run.follow.followedStreamers.find(s => s.id === '新开播').liveStatus, 'LIVE');
-  run.calls.length = 0; run.patches.length = 0;
-  await run.exports.run();
-  assert.equal(run.calls.length, 1); assert.equal(run.calls[0].args.roomId, '仍离线');
-  assert.equal(run.progress.total, 1); assert.equal(run.progress.current, 1);
+test('全部已直播也能再次校验，下一轮确认下播而不是永久留在直播中', async () => {
+  let live = true;
+  const run = setup([streamer('HUYA','原本在播','LIVE')], () => ({ is_live: live }));
+  await run.exports.run(); commitPatches(run);
+  assert.equal(run.follow.followedStreamers[0].liveStatus, 'LIVE');
+  run.calls.length = 0; run.patches.length = 0; live = false;
+  await run.exports.run(); commitPatches(run);
+  assert.equal(run.calls.length, 1);
+  assert.equal(run.follow.followedStreamers[0].liveStatus, 'OFFLINE');
 });
 
-test('待发现关注查询失败后保留缓存，下次刷新仍会重试并发现开播', async () => {
+test('新发现开播后下一轮仍校验，短直播不会卡成永久直播中', async () => {
+  let showStatus = 1;
+  const run = setup([streamer('DOUYU','短直播'), streamer('HUYA','仍离线')], command =>
+    command === 'fetch_douyu_room_info' ? { show_status: showStatus } : { is_live: false });
+  await run.exports.run(); commitPatches(run);
+  assert.equal(run.follow.followedStreamers.find(s => s.id === '短直播').liveStatus, 'LIVE');
+  run.calls.length = 0; run.patches.length = 0; showStatus = 2;
+  await run.exports.run(); commitPatches(run);
+  assert.equal(run.calls.length, 2);
+  assert.equal(run.follow.followedStreamers.find(s => s.id === '短直播').liveStatus, 'OFFLINE');
+  assert.equal(run.progress.total, 2); assert.equal(run.progress.current, 2);
+});
+
+test('状态查询失败像Simple Live一样回到UNKNOWN而非保留假直播，下次成功可恢复', async () => {
   let failed = true;
-  const cached = { ...streamer('HUYA','重试','UNKNOWN'), categoryName: '英雄联盟', nickname: '缓存昵称' };
-  const run = setup([cached], () => failed ? Promise.reject(Error('网络失败')) : { is_live: true, nick: '最新昵称' });
-  await run.exports.run(); assert.equal(run.patches.length, 0); assert.equal(run.follow.followedStreamers[0], cached);
-  failed = false; await run.exports.run();
-  assert.equal(run.calls.length, 2); assert.equal(run.patches[0].patch.liveStatus, 'LIVE');
-  assert.equal(run.patches[0].patch.nickname, '最新昵称');
+  const cached = { ...streamer('HUYA','重试','LIVE'), categoryName: '英雄联盟', nickname: '缓存昵称', popularity: 88 };
+  const run = setup([cached], () => failed ? Promise.reject(Error('网络失败')) : { is_live: false, nick: '最新昵称' });
+  await run.exports.run(); commitPatches(run);
+  assert.equal(run.calls.length, 1); assert.equal(run.patches.length, 1);
+  assert.equal(run.follow.followedStreamers[0].liveStatus, 'UNKNOWN');
+  assert.equal(run.follow.followedStreamers[0].categoryName, '英雄联盟');
+  assert.equal(Object.hasOwn(run.follow.followedStreamers[0], 'popularity'), false);
+  run.patches.length = 0;
+  failed = false; await run.exports.run(); commitPatches(run);
+  assert.equal(run.calls.length, 2); assert.equal(run.follow.followedStreamers[0].liveStatus, 'OFFLINE');
+  assert.equal(run.follow.followedStreamers[0].nickname, '最新昵称');
+  assert.equal(run.follow.followedStreamers[0].categoryName, '英雄联盟');
+  assert.equal(Object.hasOwn(run.follow.followedStreamers[0], 'popularity'), false);
 });
 
-
-test('首次延迟刷新读取最新关注快照，不再查询等待期间已开播的主播', async () => {
+test('数据就绪立即首次刷新，不等idle也不继承昨天的状态', async () => {
   let effect;
   function find(node) {
     if (ts.isCallExpression(node) && node.expression.getText(tree) === 'useEffect' &&
@@ -266,26 +309,73 @@ test('首次延迟刷新读取最新关注快照，不再查询等待期间已�
     ts.forEachChild(node, find);
   }
   find(tree); assert.ok(effect);
-  for (const status of ['LIVE', 'UNKNOWN']) {
-    const oldRender = setup([streamer('HUYA','同一个主播','UNKNOWN')], () => ({ is_live: true }));
-    const nextRender = setup([streamer('HUYA','同一个主播',status)], () => ({ is_live: true }));
-    const refreshListRef = { current: oldRender.exports.run };
-    let idle;
-    const exports = {};
-    vm.runInNewContext(ts.transpileModule('export const attach = '+effect, {
-      compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
-    }).outputText, { exports,
-      follow: { ...oldRender.follow, hydrated: true, consumeInitialAutoRefresh: () => true },
-      allStreamers: oldRender.follow.followedStreamers, REFRESH_INITIAL_DELAY_MS: 1500,
-      ensureProxyStarted: async () => {}, refreshList: oldRender.exports.run, refreshListRef,
-      window: { requestIdleCallback(fn) { idle = fn; return 1; }, cancelIdleCallback() {} }
-    });
-    const dispose = exports.attach();
-    // React publishes a new immutable context while the original idle callback is still queued.
-    refreshListRef.current = nextRender.exports.run;
-    idle(); await tick();
-    assert.equal(oldRender.calls.length, 0, '首次延迟回调使用了旧关注快照');
-    assert.equal(nextRender.calls.length, status === 'LIVE' ? 0 : 1);
-    dispose();
+  const run = setup([streamer('HUYA','缓存','LIVE')], () => ({ is_live: false }));
+  const exports = {};
+  vm.runInNewContext(ts.transpileModule('export const attach = '+effect, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
+  }).outputText, { exports, settingsHydrated: true,
+    follow: { ...run.follow, hydrated: true, consumeInitialAutoRefresh: () => true },
+    allStreamers: run.follow.followedStreamers, REFRESH_INITIAL_DELAY_MS: 1500,
+    ensureProxyStarted: async () => {}, refreshListRef: { current: run.exports.run },
+    window: { requestIdleCallback() { return 1; }, cancelIdleCallback() {} }
+  });
+  exports.attach(); await tick(); commitPatches(run);
+  assert.equal(run.calls.length, 1, '首次刷新不应等到界面空闲才确认缓存状态');
+  assert.equal(run.follow.followedStreamers[0].liveStatus, 'OFFLINE');
+});
+
+test('定时轮询调用同一状态校验流程，已直播主播下播后能自动移出直播筛选', async () => {
+  let effect;
+  function find(node) {
+    if (ts.isCallExpression(node) && node.expression.getText(tree) === 'useEffect' &&
+      node.arguments[0]?.getText(tree).includes('pollIntervalMs <= 0')) effect = node.arguments[0].getText(tree);
+    ts.forEachChild(node, find);
   }
+  find(tree); assert.ok(effect);
+  const run = setup([streamer('HUYA','轮询前在播','LIVE')], () => ({ is_live: false }));
+  const tasks = new Map(); let seq = 0;
+  const exports = {};
+  vm.runInNewContext(ts.transpileModule('export const attach = '+effect, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 }
+  }).outputText, { exports, settingsHydrated: true, pollIntervalMs: 60_000, refreshListRef: { current: run.exports.run },
+    window: { setTimeout(fn) { tasks.set(++seq,fn); return seq; }, clearTimeout(id) { tasks.delete(id); } }
+  });
+  const dispose = exports.attach();
+  tasks.get(1)(); await tick(); commitPatches(run);
+  assert.equal(run.calls.length, 1);
+  assert.equal(run.follow.followedStreamers[0].liveStatus, 'OFFLINE');
+  assert.equal(grouping.buildFollowGameGroups(run.follow.followedStreamers, 'ALL', 'LIVE').length, 0);
+  dispose();
+});
+
+
+test('手动并发数覆盖CPU自动值，固定worker持续取任务', async () => {
+  for (const count of [1,4,8,20]) {
+    let resolve; const gate = new Promise(done => resolve = done);
+    const run = setup(Array.from({length:25},(_,i)=>streamer('HUYA',String(i))),()=>gate,2,count);
+    const pending=run.exports.run(); await tick();
+    assert.equal(run.calls.length,count); resolve({is_live:false}); await pending;
+    assert.equal(run.calls.length,25); assert.equal(run.progress.current,25);
+  }
+});
+
+test('Simple Live热度为0或缺失时保持未知而非当成已知热度', async () => {
+  for (const popularity of [0,null,undefined,-1]) {
+    const run=setup([],()=>({is_live:true,popularity}));
+    assert.equal((await run.exports.refreshOne(streamer('HUYA','1'))).popularity,undefined);
+  }
+});
+
+test('虎牙查询错误不能冒充已确认未开播', async () => {
+  const run=setup([streamer('HUYA','错误','LIVE')],()=>Promise.reject('主播未开播或获取虎牙房间详情失败'));
+  await run.exports.run(); commitPatches(run);
+  assert.equal(run.follow.followedStreamers[0].liveStatus,'UNKNOWN');
+});
+
+test('像Simple Live一样新开播立即发布，普通状态变更在整轮结束合并发布', async () => {
+  let resolve;const gate=new Promise(done=>resolve=done);
+  const run=setup([streamer('HUYA','慢'),streamer('HUYA','下播','LIVE')],(_c,args)=>args.roomId==='慢'?gate:{is_live:false});
+  const pending=run.exports.run();await tick();run.flush();
+  assert.equal(run.patches.length,0,'普通下播应随本轮最终筛选一起发布');
+  resolve({is_live:false});await pending;assert.equal(run.patches.length,2);
 });

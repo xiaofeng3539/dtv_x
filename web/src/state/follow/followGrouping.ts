@@ -28,16 +28,17 @@ function validPopularity(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value) && value >= 0;
 }
 
-/** 热度只属于本次运行，不进入缓存、导出或同步文件。 */
+/** 与 Simple Live FollowUser 一致：直播状态和热度仅属于本次运行，不进入缓存、导出或同步。 */
 export function stripFollowRuntime<T extends object>(streamer: T): T {
   const next = { ...streamer } as T & { popularity?: number };
   delete next.popularity;
+  delete (next as Record<string, unknown>).liveStatus;
   return next;
 }
 
 /** 合并两个持久化来源，旧版本/空字段不会抹掉已有有效分类。 */
 export function reconcileFollowMetadata(streamer: FollowedStreamer, stored: Partial<FollowedStreamer>): FollowedStreamer {
-  const next = stripFollowRuntime({ ...streamer, ...stored, id: streamer.id, platform: streamer.platform });
+  const next = { ...stripFollowRuntime({ ...streamer, ...stored, id: streamer.id, platform: streamer.platform }), liveStatus: "UNKNOWN" as const };
   const incoming = normalizeFollowCategory(stored.categoryName);
   const previous = normalizeFollowCategory(streamer.categoryName);
   if (incoming !== "其他") {

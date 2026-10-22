@@ -127,7 +127,7 @@ test('Provider离线首次分类、变更和失败缓存均可重启恢复且不
     { platform: 'HUYA', id: 'unknown', patch: {} }
   ]); app.render();
   const restarted = providerHarness(local);
-  assert.deepEqual(plain(restarted.value.followedStreamers).map(item => [item.id, item.liveStatus, item.categoryName, Object.hasOwn(item, 'popularity')]), [['offline', 'OFFLINE', '绝地求生', false], ['unknown', 'UNKNOWN', '无畏契约', false], ['top', 'OFFLINE', '我的世界', false]]);
+  assert.deepEqual(plain(restarted.value.followedStreamers).map(item => [item.id, item.liveStatus, item.categoryName, Object.hasOwn(item, 'popularity')]), [['offline', 'UNKNOWN', '绝地求生', false], ['unknown', 'UNKNOWN', '无畏契约', false], ['top', 'UNKNOWN', '我的世界', false]]);
   assert.deepEqual(plain(restarted.value.folders), [folder]);
   assert.deepEqual(plain(restarted.value.listOrder).map(item => [item.type, item.data.id]), order);
 });
@@ -141,7 +141,7 @@ test('离线和UNKNOWN分类经LAN导出导入后由Provider重启保留，不�
   const target = storage();
   sync.applyIncrementalLanSyncImport(target, payload.entries);
   const restarted = providerHarness(target);
-  assert.deepEqual(plain(restarted.value.followedStreamers).map(item => [item.id, item.liveStatus, item.categoryName, item.categoryId, Object.hasOwn(item, 'popularity')]), [['offline', 'OFFLINE', '英雄联盟', 'game-offline', false], ['unknown', 'UNKNOWN', '无畏契约', 'game-unknown', false]]);
+  assert.deepEqual(plain(restarted.value.followedStreamers).map(item => [item.id, item.liveStatus, item.categoryName, item.categoryId, Object.hasOwn(item, 'popularity')]), [['offline', 'UNKNOWN', '英雄联盟', 'game-offline', false], ['unknown', 'UNKNOWN', '无畏契约', 'game-unknown', false]]);
   assert.deepEqual(plain(restarted.value.folders[0].streamerIds), ['HUYA:offline']);
   assert.deepEqual(plain(restarted.value.listOrder).map(item => [item.type, item.data.id]), [['folder', 'remote-folder'], ['streamer', 'unknown']]);
 });
@@ -149,6 +149,7 @@ test('离线和UNKNOWN分类经LAN导出导入后由Provider重启保留，不�
 test('Provider单条及批量相同刷新保持主播和顺序数组引用避免重复持久化', () => {
   const item = { ...s('1', '英雄联盟'), liveStatus: 'OFFLINE' };
   const app = providerHarness(storage({ followedStreamers: [item] }));
+  app.value.updateStreamer('HUYA', '1', { liveStatus: 'OFFLINE' }); app.render();
   const followed = app.value.followedStreamers, order = app.value.listOrder;
   app.value.updateStreamer('HUYA', '1', { categoryName: 'LOL', categoryId: 'game-1', liveStatus: 'OFFLINE' }); app.render();
   assert.equal(app.value.followedStreamers, followed);
@@ -187,5 +188,33 @@ test('损坏或旧版筛选配置回退默认，不影响关注数据', () => {
     assert.equal(app.value.platformFilter, 'ALL');
     assert.equal(app.value.statusFilter, 'ALL');
     assert.equal(app.value.followedStreamers[0].id, '1');
+  }
+});
+
+
+test('Simple Live冷启动不恢复旧LIVE或OFFLINE，类别和人工归属保留，持久化和同步不含状态', () => {
+  const item=s('昨天','英雄联盟');const folder={id:'f',name:'原文件夹',streamerIds:['HUYA:昨天']};
+  const local=storage({followedStreamers:[item],followFolders:[folder],followListOrder:[{type:'folder',data:folder},{type:'streamer',data:item}]});
+  const app=providerHarness(local);
+  assert.equal(app.value.followedStreamers[0].liveStatus,'UNKNOWN');
+  assert.equal(app.value.followedStreamers[0].categoryName,'英雄联盟');
+  assert.deepEqual(plain(app.value.folders),[folder]);
+  app.value.updateStreamer('HUYA','昨天',{liveStatus:'LIVE',popularity:100});app.render();
+  assert.equal(app.value.followedStreamers[0].liveStatus,'LIVE');
+  assert.equal(Object.hasOwn(local.json('followedStreamers')[0],'liveStatus'),false);
+  const sync=load('services/lanSync.ts'),payload=sync.createLanSyncPayload(local);
+  assert.equal(Object.hasOwn(JSON.parse(payload.entries.followedStreamers)[0],'liveStatus'),false);
+  assert.equal(providerHarness(local).value.followedStreamers[0].liveStatus,'UNKNOWN');
+});
+
+
+test('增量导入落盘的主播库与新增顺序条目均不持久化UNKNOWN或任何直播状态', () => {
+  const sync=load('services/lanSync.ts'),local=storage();
+  const item=s('新导入','英雄联盟');
+  sync.applyIncrementalLanSyncImport(local,{followedStreamers:JSON.stringify([item])});
+  for(const entry of [local.json('followedStreamers')[0],local.json('followListOrder')[0].data]){
+    assert.equal(Object.hasOwn(entry,'liveStatus'),false);
+    assert.equal(Object.hasOwn(entry,'popularity'),false);
+    assert.equal(entry.categoryName,'英雄联盟');
   }
 });

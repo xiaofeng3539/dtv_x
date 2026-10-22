@@ -231,7 +231,7 @@ function SettingsModalContent({ onClose }: { onClose: () => void }) {
                     <div className={styles.row}>
                       <div className={styles.rowText}>
                         <div className={styles.rowName}>关注列表轮询</div>
-                        <div className={styles.rowDesc}>每隔一段时间自动刷新关注主播的开播状态；仅在窗口可见时执行，几乎不增加资源占用</div>
+                        <div className={styles.rowDesc}>按间隔校验全部关注的直播状态；全屏、切换页面时继续运行，查询失败显示未知</div>
                       </div>
                       <select
                         className={styles.select}
@@ -243,6 +243,17 @@ function SettingsModalContent({ onClose }: { onClose: () => void }) {
                         <option value="2">2 分钟</option>
                         <option value="5">5 分钟</option>
                         <option value="10">10 分钟</option>
+                      </select>
+                    </div>
+                    <div className={styles.row}>
+                      <div className={styles.rowText}>
+                        <div className={styles.rowName}>关注刷新并发</div>
+                        <div className={styles.rowDesc}>与 Simple Live 一致：自动按 CPU 核心数分配 4–20 个查询，也可手动指定</div>
+                      </div>
+                      <select className={styles.select} aria-label="关注刷新并发" value={String(settings.followRefreshConcurrency)}
+                        onChange={(e) => update({ followRefreshConcurrency: Number(e.target.value) })}>
+                        <option value="0">自动</option>
+                        {Array.from({ length: 20 }, (_, i) => i + 1).map(count => <option key={count} value={count}>{count}</option>)}
                       </select>
                     </div>
                     <div className={styles.row}>

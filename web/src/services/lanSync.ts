@@ -436,7 +436,7 @@ export function applyIncrementalLanSyncImport(storage: Storage, remoteEntries: P
     const key = normalizeStreamerKey(`${s.platform}:${s.id}`).key;
     if (folderedKeys.has(key) || streamerKeysInOrder.has(key)) continue;
     streamerKeysInOrder.add(key);
-    updatedStreamerItems.push({ type: "streamer", data: s });
+    updatedStreamerItems.push({ type: "streamer", data: stripFollowRuntime(s) });
   }
 
   const mergedOrder: FollowListItem[] = [...updatedFolderItems, ...updatedStreamerItems];
@@ -469,7 +469,7 @@ export function applyIncrementalLanSyncImport(storage: Storage, remoteEntries: P
   // Apply danmu preferences only when local missing/invalid (incremental).
   const canApplyRemotePreferences = !localDanmuPreferences && !!remoteDanmuPreferencesFromKey;
 
-  storage.setItem("followedStreamers", JSON.stringify(mergedStreamers));
+  storage.setItem("followedStreamers", JSON.stringify(mergedStreamers.map(stripFollowRuntime)));
   storage.setItem("followFolders", JSON.stringify(mergedFolders));
   storage.setItem("followListOrder", JSON.stringify(mergedOrder));
   if (mergedCategories.length) storage.setItem("dtv_custom_categories_v1", JSON.stringify(mergedCategories));

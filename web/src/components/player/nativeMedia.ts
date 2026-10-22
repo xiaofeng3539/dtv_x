@@ -34,6 +34,7 @@ export function createNativeMedia(
   invoke: Invoke,
   headers: Readonly<Record<string, string>> = {},
 ) {
+  let mediaHeaders = { ...headers };
   let disposed = false;
   let generation = 0;
   let src = "";
@@ -73,7 +74,7 @@ export function createNativeMedia(
     state = { ...state, generation, loaded: false, paused: false, buffering: true, ended: false,
       position: null, cacheEnd: null, width: null, height: null, error: null };
     emit("loadstart"); emit("waiting");
-    opened = invoke("native_player_open", { generation: owner, url: src, headers: { ...headers } }).then(async () => {
+    opened = invoke("native_player_open", { generation: owner, url: src, headers: { ...mediaHeaders } }).then(async () => {
       if (disposed || owner !== generation) return;
       await invoke("native_player_volume", { generation: owner, volume: state.volume });
       await invoke("native_player_muted", { generation: owner, muted: state.muted });
@@ -128,6 +129,7 @@ export function createNativeMedia(
 
   return {
     video,
+    setHeaders(next: Readonly<Record<string, string>>) { mediaHeaders = { ...next }; },
     get generation() { return generation; },
     get ready() { return opened; },
     accept(next: NativeSnapshot) {
@@ -137,7 +139,8 @@ export function createNativeMedia(
       if (state.error && state.error !== previous.error) emit("error");
       if (state.loaded && !previous.loaded) { emit("loadedmetadata"); emit("loadeddata"); emit("canplay"); emit("canplaythrough"); }
       if (state.buffering && !previous.buffering) emit("waiting");
-      if (state.loaded && !state.buffering && !state.paused && (!previous.loaded || previous.buffering || previous.paused)) emit("playing");
+      if (state.loaded && state.position !== null && !state.buffering && !state.paused &&
+          (!previous.loaded || previous.position === null || previous.buffering || previous.paused)) emit("playing");
       if (state.paused !== previous.paused) emit(state.paused ? "pause" : "play");
       if (state.position !== previous.position) emit("timeupdate");
       if (state.cacheEnd !== previous.cacheEnd) emit("progress");

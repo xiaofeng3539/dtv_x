@@ -1,5 +1,5 @@
 use reqwest::header::{HeaderMap as ReqwestHeaderMap, HeaderName, HeaderValue, USER_AGENT};
-use reqwest::{cookie::Jar, Client, RequestBuilder, Response};
+use reqwest::{cookie::{CookieStore, Jar}, Client, RequestBuilder, Response};
 use std::error::Error;
 use std::sync::Arc;
 use std::time::Duration;
@@ -16,6 +16,7 @@ const FOLLOW_POOL_IDLE_TIMEOUT_SECONDS: u64 = 15;
 pub struct HttpClient {
     pub inner: Client,
     headers: ReqwestHeaderMap,
+    cookie_jar: Arc<Jar>,
 }
 
 #[allow(dead_code)]
@@ -60,7 +61,7 @@ impl HttpClient {
             .http1_only()
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECONDS))
             .connect_timeout(Duration::from_secs(15))
-            .cookie_provider(cookie_jar);
+            .cookie_provider(cookie_jar.clone());
 
         let inner_client = client_builder
             .build()
@@ -69,6 +70,7 @@ impl HttpClient {
         Ok(HttpClient {
             inner: inner_client,
             headers: default_headers,
+            cookie_jar,
         })
     }
 
@@ -88,7 +90,7 @@ impl HttpClient {
             .http1_only()
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECONDS))
             .connect_timeout(Duration::from_secs(15))
-            .cookie_provider(cookie_jar)
+            .cookie_provider(cookie_jar.clone())
             .no_proxy(); // 关键：禁用所有代理设置
 
         let inner_client = client_builder
@@ -98,6 +100,7 @@ impl HttpClient {
         Ok(HttpClient {
             inner: inner_client,
             headers: default_headers,
+            cookie_jar,
         })
     }
 
@@ -116,7 +119,7 @@ impl HttpClient {
             .http1_only()
             .timeout(Duration::from_secs(DEFAULT_TIMEOUT_SECONDS))
             .connect_timeout(Duration::from_secs(15))
-            .cookie_provider(cookie_jar)
+            .cookie_provider(cookie_jar.clone())
             .no_proxy()
             .pool_max_idle_per_host(max_idle_per_host)
             .pool_idle_timeout(Duration::from_secs(FOLLOW_POOL_IDLE_TIMEOUT_SECONDS));
@@ -128,7 +131,13 @@ impl HttpClient {
         Ok(HttpClient {
             inner: inner_client,
             headers: default_headers,
+            cookie_jar,
         })
+    }
+
+    /// Reuse cookies issued to this client without creating another visitor session.
+    pub fn cookie_header(&self, url: &str) -> Option<HeaderValue> {
+        self.cookie_jar.cookies(&url::Url::parse(url).ok()?)
     }
 
     // Method to add or update a header for subsequent requests made with this client instance

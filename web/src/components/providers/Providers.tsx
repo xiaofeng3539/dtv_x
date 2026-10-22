@@ -4,6 +4,7 @@ import React from "react";
 
 import { ThemeProvider } from "@/state/theme/ThemeProvider";
 import { FollowProvider } from "@/state/follow/FollowProvider";
+import { FollowRefreshProvider } from "@/state/follow/FollowRefreshProvider";
 import { CustomCategoriesProvider } from "@/state/customCategories/CustomCategoriesProvider";
 import { PlayerUiProvider } from "@/state/playerUi/PlayerUiProvider";
 import { SettingsProvider } from "@/state/settings/SettingsProvider";
@@ -14,12 +15,14 @@ export function Providers({ children }: { children: React.ReactNode }) {
     <SettingsProvider>
       <ThemeProvider>
         <FollowProvider>
-          <PlayerUiProvider>
-            <CustomCategoriesProvider>
-              <HighRefreshRateEffect />
-              {children}
-            </CustomCategoriesProvider>
-          </PlayerUiProvider>
+          <FollowRefreshProvider>
+            <PlayerUiProvider>
+              <CustomCategoriesProvider>
+                <HighRefreshRateEffect />
+                {children}
+              </CustomCategoriesProvider>
+            </PlayerUiProvider>
+          </FollowRefreshProvider>
         </FollowProvider>
       </ThemeProvider>
     </SettingsProvider>

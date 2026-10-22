@@ -28,6 +28,8 @@ pub async fn stop_douyin_danmu_listener(
 
 #[tauri::command]
 pub async fn start_douyin_danmu_listener(
+    resolved_room_id: Option<String>,
+    follow_http: tauri::State<'_, crate::platforms::common::FollowHttpClient>,
     payload: crate::platforms::common::GetStreamUrlPayload,
     app_handle: tauri::AppHandle,
     state: tauri::State<'_, crate::platforms::common::DouyinDanmakuState>,
@@ -65,6 +67,8 @@ pub async fn start_douyin_danmu_listener(
         *lock = Some(tx_shutdown);
     }
 
+    let session_client = follow_http.0.clone();
+    let mut bootstrap_room_id = resolved_room_id.filter(|id| id.len() > 16 && id.len() <= 24 && id.bytes().all(|b| b.is_ascii_digit()));
     let app_handle_clone = app_handle.clone();
     let room_id_str_clone = normalized_room_id.clone();
 
@@ -81,6 +85,9 @@ pub async fn start_douyin_danmu_listener(
             let mut max_backoff_secs = 30u64;
             let result = async {
                 let mut fetcher = crate::platforms::douyin::danmu::web_fetcher::DouyinLiveWebFetcher::new(&room_id_str_clone)?;
+                fetcher.http_client = session_client.clone();
+                // Only the initial connection reuses this playback result; reconnects revalidate the room.
+                fetcher.room_id = bootstrap_room_id.take();
                 fetcher
                     .fetch_room_details()
                     .await

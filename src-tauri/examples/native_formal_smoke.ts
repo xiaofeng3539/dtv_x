@@ -1,6 +1,7 @@
 import Player from "xgplayer";
 import "xgplayer/dist/index.min.css";
 import "../../web/src/components/player/player.css";
+import settingsStyles from "../../web/src/components/settings/SettingsModal.module.css";
 import navbarStyles from "../../web/src/components/shell/Navbar.module.css";
 import shellStyles from "../../web/src/components/shell/AppShell.module.css";
 import overlayStyles from "../../web/src/state/playerOverlay/PlayerOverlayProvider.module.css";
@@ -69,6 +70,22 @@ async function main() {
     assert(document.elementFromPoint(modalRect.x+modalRect.width/2,modalRect.y+modalRect.height/2) === modalClose, "titlebar dialog loses pointer interaction while playing");
     modal.remove();
     await invoke("smoke_report", { report: { stage: "single-interactive-titlebar-and-dialog", passed: true } });
+    // Settings is a body portal, not a descendant of Navbar's z-index 600 stack.
+    const settings = document.createElement("div"); settings.className = settingsStyles.backdrop;
+    const settingsCard = document.createElement("section"); settingsCard.className = settingsStyles.card;
+    settingsCard.innerHTML = '<button id="settings-tab">平台设置</button><button id="settings-switch" role="switch" aria-checked="true">开关</button><select id="settings-select"><option>原画</option><option>高清</option></select><button id="settings-close">关闭设置</button>';
+    settings.append(settingsCard); document.body.append(settings);
+    let settingsClicks = 0;
+    settingsCard.querySelectorAll('button').forEach(button => button.addEventListener('click',()=>settingsClicks++));
+    for (const id of ["settings-tab", "settings-switch", "settings-select", "settings-close"]) {
+      const control = settings.querySelector('#'+id) as HTMLElement, r = control.getBoundingClientRect();
+      const hit = document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);
+      assert(hit===control || control.contains(hit), "settings control blocked by player: "+id);
+      if (control.tagName === 'BUTTON') hit!.dispatchEvent(new MouseEvent('click',{bubbles:true}));
+    }
+    assert(settingsClicks===3, "settings actions did not receive pointer events");settings.remove();
+    await invoke("smoke_report", { report: { stage: "body-settings-pointer-controls", passed: true } });
+
     await invoke("smoke_report", { report: { stage: "room-list-backdrop-isolation", passed: true } });
     await invoke("smoke_report", { report: { stage: "first-frame-native-controls", initial } });
     player.pause(); await until(s => s.paused, "pause failed");
@@ -109,7 +126,22 @@ async function main() {
     assert(getComputedStyle(document.body).backgroundColor === "rgba(0, 0, 0, 0)", "PiP exit did not restore inline native video");
     verifyIsolation();
     await invoke("smoke_report", { report: { stage: "pause-volume-mute-window-fullscreen-pip", passed: true } });
-    for (let i = 0; i < 30; i++) player.src = media;
+    player.pause(); await until(s => s.paused, "old room pause failed");
+    const switchStarted = Date.now();
+    await player.switchURL(media, { platform: "HUYA" });
+    const resumed = await until(s => s.loaded && !s.paused && s.position > 0.05, "new room inherited pause or canplay gate");
+    assert(Date.now()-switchStarted < 8000, "native media handoff waited too long");
+    await invoke("smoke_report", { report: { stage: "native-direct-open-resets-pause", elapsedMs: Date.now()-switchStarted, resumed } });
+    const pendingPauseSwitch = player.switchURL(media, { platform: "DOUYIN" });
+    player.pause();
+    await pendingPauseSwitch;
+    await until(s => s.loaded && s.paused, "new user pause was overwritten after media open");
+    await sleep(300);
+    assert((await state()).paused && bridge.video.paused, "pending switch resumed against user intent");
+    await invoke("smoke_report", { report: { stage: "pending-switch-preserves-new-pause", passed: true } });
+    const switches = [];
+    for (let i = 0; i < 30; i++) switches.push(player.switchURL(media, { platform: i%2 ? "DOUYIN" : "BILIBILI" }));
+    await Promise.all(switches);
     await bridge.ready;
     const switched = await until(s => s.loaded && s.generation > initial.generation && s.position > 0.05, "latest fast switch failed");
     assert(switched.error === null, "old event affected current media");

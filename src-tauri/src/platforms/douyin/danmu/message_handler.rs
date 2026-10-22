@@ -11,6 +11,10 @@ use crate::platforms::douyin::danmu::gen::{PushFrame, Response}; // Removed ::do
 use crate::platforms::douyin::danmu::message_parsers;
 use crate::platforms::douyin::danmu::websocket_connection::WsStream; // Corrected path // Corrected path
 
+fn acknowledgement(log_id: u64, internal_ext: &str) -> PushFrame {
+    PushFrame { log_id, payload_type: "ack".into(), payload: internal_ext.as_bytes().to_vec(), ..Default::default() }
+}
+
 // This function will handle the message receiving loop and parsing
 pub async fn handle_received_messages(
     mut read_stream: SplitStream<WsStream>,
@@ -35,14 +39,7 @@ pub async fn handle_received_messages(
                                 match Response::decode(decompressed_payload.as_slice()) {
                                     Ok(response) => {
                                         if response.need_ack {
-                                            let ack_payload_bytes =
-                                                response.internal_ext.encode_to_vec();
-                                            let ack_push_frame = PushFrame {
-                                                log_id: push_frame.log_id,
-                                                payload_type: "ack".to_string(),
-                                                payload: ack_payload_bytes,
-                                                ..Default::default()
-                                            };
+                                            let ack_push_frame = acknowledgement(push_frame.log_id, &response.internal_ext);
                                             let mut ack_buf = Vec::new();
                                             if ack_push_frame.encode(&mut ack_buf).is_ok() {
                                                 if ack_tx
@@ -119,4 +116,14 @@ pub async fn handle_received_messages(
     }
     debug!("[Douyin Danmaku] Message handler finished.");
     Ok(())
+}
+
+#[cfg(test)]
+mod parity_tests {
+ use super::*;
+ #[test]
+ fn ack_carries_raw_utf8_internal_ext_not_a_protobuf_string_wrapper() {
+  let frame=acknowledgement(42,"确认|room:123");assert_eq!(frame.log_id,42);assert_eq!(frame.payload_type,"ack");
+  assert_eq!(frame.payload,"确认|room:123".as_bytes());
+ }
 }

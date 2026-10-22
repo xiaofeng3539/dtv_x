@@ -25,7 +25,7 @@ function renderFollow(overlay = false, filters = {}) {
   const follow = { platformFilter: "ALL", statusFilter: "ALL", setPlatformFilter() {}, setStatusFilter() {}, ...filters, followedStreamers: streamers,
     listOrder: streamers.map(data => ({ type: 'streamer', data })), folders: [], hydrated: true };
   let stateIndex = 0;
-  const react = { ...React, useState(initial) { return React.useState(overlay && stateIndex++ === 5 ? true : initial); } };
+  const react = { ...React, useState(initial) { return React.useState(overlay && stateIndex++ === 1 ? true : initial); } };
   const motion = new Proxy({}, { get(_t, tag) { return ({ children, ...props }) => {
     for (const key of ['initial', 'animate', 'exit', 'transition', 'layout', 'layoutId']) delete props[key];
     return React.createElement(tag, props, children);
@@ -40,6 +40,7 @@ function renderFollow(overlay = false, filters = {}) {
       useMotionValue: () => ({ set() {} }), useSpring: () => 0 };
     if (id === 'lucide-react') return new Proxy({}, { get: () => () => null });
     if (id.endsWith('.module.css')) return { __esModule: true, default: new Proxy({}, { get: (_t, key) => key }) };
+    if (id.endsWith('/FollowRefreshProvider')) return { useFollowRefresh: () => ({ isRefreshing: false, progressCurrent: 0, progressTotal: 0, showCheckIcon: false, refreshList: async () => {} }) };
     if (id.endsWith('/FollowProvider')) return { useFollow: () => follow };
     if (id.endsWith('/followGrouping')) return loadTs(path.join(__dirname, '../src/state/follow/followGrouping.ts'), importer);
     if (id.endsWith('/SettingsProvider')) return { useAppSettings: () => ({ settings: { followPollIntervalMin: 0 } }) };

@@ -9,7 +9,6 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
-use urlencoding;
 
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, REFERER, USER_AGENT};
 
@@ -134,142 +133,19 @@ impl DouyinLiveWebFetcher {
     pub async fn collect_cookies_and_ids(
         &mut self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Ensure room_id has been resolved before collecting cookies
-        self.resolve_room_info().await?;
-
+        // Simple Live bootstraps danmaku from the resolved room and its HTTP session.
+        // Do not repeat HEAD/GET of the room page just to generate an optional user ID.
         if let Ok(cookie) = std::env::var("DTVX_DOUYIN_COOKIE") {
-            let cookie = cookie.trim().to_string();
-            if !cookie.is_empty() {
-                self.dy_cookie = Some(cookie);
-            }
+            if !cookie.trim().is_empty() { self.dy_cookie = Some(cookie); }
         }
-
-        let room_page_url = format!("https://live.douyin.com/{}", self.live_id);
-
-        // 先通过 HEAD 请求收集初始 Cookie
-        let head_resp = self
-            .http_client
-            .inner
-            .head(&room_page_url)
-            .header("User-Agent", &self.user_agent)
-            .header("Referer", "https://live.douyin.com/")
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
-            .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-            .send()
-            .await?;
-
-        let mut dy_cookie = self.dy_cookie.clone().unwrap_or_default();
-        if !dy_cookie.is_empty() && !dy_cookie.ends_with(';') {
-            dy_cookie.push(';');
+        if self.room_id.is_none() { self.resolve_room_info().await?; }
+        self.dy_cookie = Some(crate::platforms::douyin::web_api::active_cookie(
+            &self.http_client, "https://live.douyin.com/", self.dy_cookie.as_deref(),
+        ));
+        if self.user_unique_id.is_none() {
+            use rand::RngExt;
+            self.user_unique_id = Some(rand::rng().random_range(100_000_000_000u64..1_000_000_000_000).to_string());
         }
-
-        for val in head_resp.headers().get_all("set-cookie").iter() {
-            if let Ok(s) = val.to_str() {
-                let first = s.split(';').next().unwrap_or("");
-                if first.contains("ttwid")
-                    || first.contains("__ac_nonce")
-                    || first.contains("msToken")
-                    || first.contains("s_v_web_id")
-                    || first.contains("tt_scid")
-                {
-                    dy_cookie.push_str(first);
-                    dy_cookie.push(';');
-                }
-            }
-        }
-
-        // 再通过 GET 请求补全 Cookie，并尽量解析页面 RENDER_DATA 获取 user_unique_id（更接近真实 webid）。
-        let get_resp = self
-            .http_client
-            .inner
-            .get(&room_page_url)
-            .header("User-Agent", &self.user_agent)
-            .header("Referer", "https://live.douyin.com/")
-            .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7")
-            .header("Accept-Language", "zh-CN,zh;q=0.9,en;q=0.8")
-            .send()
-            .await?;
-
-        let get_headers = get_resp.headers().clone();
-        let html = get_resp.text().await.unwrap_or_default();
-
-        for val in get_headers.get_all("set-cookie").iter() {
-            if let Ok(s) = val.to_str() {
-                let first = s.split(';').next().unwrap_or("");
-                if first.contains("ttwid")
-                    || first.contains("__ac_nonce")
-                    || first.contains("msToken")
-                    || first.contains("s_v_web_id")
-                    || first.contains("tt_scid")
-                {
-                    if !dy_cookie.contains(first) {
-                        dy_cookie.push_str(first);
-                        dy_cookie.push(';');
-                    }
-                }
-            }
-        }
-
-        let mut render_webid: Option<String> = None;
-        if !html.is_empty() {
-            let marker = "<script id=\"RENDER_DATA\" type=\"application/json\">";
-            if let Some(start_pos) = html.find(marker) {
-                let body_start = start_pos + marker.len();
-                if let Some(end_rel) = html[body_start..].find("</script>") {
-                    let raw = &html[body_start..body_start + end_rel];
-                    let decoded = urlencoding::decode(raw).unwrap_or_else(|_| raw.into());
-                    if let Ok(v) = serde_json::from_str::<Value>(&decoded) {
-                        let uid_val = v
-                            .get("app")
-                            .and_then(|a| a.get("odin"))
-                            .and_then(|o| o.get("user_unique_id"))
-                            .cloned();
-                        if let Some(uid_val) = uid_val {
-                            if let Some(s) = uid_val.as_str() {
-                                if !s.is_empty() {
-                                    render_webid = Some(s.to_string());
-                                }
-                            } else if uid_val.is_number() {
-                                render_webid = Some(uid_val.to_string());
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        // 从 Cookie 中提取 user_unique_id（优先使用 s_v_web_id），失败则回退到 ttwid，最后生成一个临时值
-        let mut user_unique_id = render_webid.unwrap_or_default();
-        if user_unique_id.is_empty() {
-            for kv in dy_cookie.split(';') {
-                let kv = kv.trim();
-                if let Some(v) = kv.strip_prefix("s_v_web_id=") {
-                    user_unique_id = v.to_string();
-                    break;
-                }
-            }
-        }
-        if user_unique_id.is_empty() {
-            for kv in dy_cookie.split(';') {
-                let kv = kv.trim();
-                if let Some(v) = kv.strip_prefix("ttwid=") {
-                    user_unique_id = v.to_string();
-                    break;
-                }
-            }
-        }
-        if user_unique_id.is_empty() {
-            // 生成一个简单的基于当前时间戳的 ID，避免为空导致签名/连接失败
-            let millis = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis();
-            user_unique_id = format!("{}", millis);
-        }
-
-        // 设置 room_id：如果尚未设置，且传入的 live_id 是纯数字，则直接视为 room_id
-        self.dy_cookie = Some(dy_cookie);
-        self.user_unique_id = Some(user_unique_id);
         Ok(())
     }
 
@@ -478,4 +354,26 @@ pub async fn fetch_douyin_room_info(live_id: String) -> Result<DouyinFollowListR
         avatar_url,
         status,
     })
+}
+
+#[cfg(test)]
+mod parity_bootstrap_tests {
+ use super::*;
+ #[tokio::test]
+ async fn resolved_api_room_bootstraps_danmaku_without_duplicate_html_requests() {
+  let mut fetcher=DouyinLiveWebFetcher::new("123456").unwrap();
+  fetcher.room_id=Some("1234567890123456789".into());
+  fetcher.resolved_info=Some(ResolvedRoomInfo{web_rid:Some("123456".into()),room_id:"1234567890123456789".into(),nickname:"主播".into(),room_name:"直播".into(),avatar_url:"".into(),status:2});
+  let result=tokio::time::timeout(std::time::Duration::from_millis(100),fetcher.collect_cookies_and_ids()).await;
+  assert!(result.is_ok(),"已有房间数据不应再次HEAD/GET直播网页");result.unwrap().unwrap();
+  assert!(fetcher.dy_cookie.as_deref().unwrap_or("").contains("ttwid="));
+  let id=fetcher.user_unique_id.unwrap();assert_eq!(id.len(),12);assert!(id.bytes().all(|b|b.is_ascii_digit()));
+ }
+ #[tokio::test]
+ async fn playback_resolved_room_id_skips_a_second_metadata_request() {
+  let mut fetcher=DouyinLiveWebFetcher::new("123456").unwrap();fetcher.room_id=Some("1234567890123456789".into());
+  let result=tokio::time::timeout(std::time::Duration::from_millis(100),fetcher.collect_cookies_and_ids()).await;
+  assert!(result.is_ok(),"播放已经返回实际room_id时不应再次查询详情");result.unwrap().unwrap();
+ }
+
 }

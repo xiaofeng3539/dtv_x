@@ -75,7 +75,17 @@ export async function createNativePlayback(platform: string) {
   return {
     video,
     get ready() { return adapter.ready; },
-    attach(player: { root: HTMLElement; on: (name: string, callback: () => void) => void }) {
+    attach(player: { root: HTMLElement; on: (name: string, callback: () => void) => void; src?: string;
+      switchURL?: (url: string | { url: string }, options?: { platform?: string; seamless?: boolean }) => Promise<unknown> }) {
+      // Native playback follows Simple Live player.open(Media): no browser canplay gate,
+      // no live seek to the previous room's time, and no inherited paused state.
+      player.switchURL = (value, options) => {
+        if (disposed) return Promise.resolve();
+        if (options?.platform) adapter.setHeaders(nativeMediaHeaders(options.platform));
+        player.src = typeof value === "string" ? value : value.url;
+        // setSource opens unpaused; do not override a new user pause while open is pending.
+        return adapter.ready;
+      };
       const root = player.root;
       root.classList.add("dtv-native-player");
       let backgrounds: ReturnType<typeof revealVideo> | undefined;

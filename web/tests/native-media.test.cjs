@@ -69,3 +69,11 @@ test('platform media headers match Simple Live and never leak Bilibili headers t
  assert.equal(Object.keys(context.exports.nativeMediaHeaders('DOUYIN')).length,0);
  assert.equal(Object.keys(context.exports.nativeMediaHeaders('DOUYU')).length,0);
 });
+
+
+test('libmpv媒体已加载但尚无解码进度时，不提前宣布playing或清空恢复预算',async()=>{
+ const {adapter,video,calls}=setup();let playing=0;video.addEventListener('playing',()=>playing++);
+ video.src='https://stream.test/live';await tick();const gen=calls[0].args.generation;
+ adapter.accept(snapshot(gen,{position:null}));assert.equal(playing,0);
+ adapter.accept(snapshot(gen,{position:0.1}));assert.equal(playing,1);
+});

@@ -614,27 +614,18 @@ async fn fetch_profile_room(
     client: &reqwest::Client,
     room_id: &str,
 ) -> Result<Value, Box<dyn Error + Send + Sync>> {
-    let url = format!(
-        "https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid={}&showSecret=1",
-        room_id
-    );
-    let mut headers = HeaderMap::new();
-    headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
-    headers.insert(ORIGIN, HeaderValue::from_static("https://www.huya.com"));
-    headers.insert(REFERER, HeaderValue::from_static("https://www.huya.com/"));
-    headers.insert(USER_AGENT, HeaderValue::from_static(DESKTOP_UA));
+    fetch_profile_room_at(client, room_id, "https://m.huya.com", "https://mp.huya.com/cache.php").await
+}
 
-    let resp = client
-        .get(&url)
-        .headers(headers)
-        .send()
-        .await?
-        .error_for_status()?;
-    let text = resp.text().await?;
-    let v: Value = serde_json::from_str(&text)?;
-
-    validate_profile_room(&v)?;
-    Ok(v)
+async fn fetch_profile_room_at(
+    client: &reqwest::Client,
+    room_id: &str,
+    mobile_base: &str,
+    profile_api: &str,
+) -> Result<Value, Box<dyn Error + Send + Sync>> {
+    let (_, profile) = fetch_room_profile_at(client, room_id, mobile_base, profile_api).await?;
+    validate_profile_room(&profile)?;
+    Ok(profile)
 }
 
 fn parse_i64_lossy(v: Option<&Value>) -> i64 {
@@ -1084,18 +1075,25 @@ fn follow_room_id_from_page(page: &str) -> Result<String, String> {
     Err("虎牙官方页面未返回有效房间号".to_string())
 }
 
-async fn fetch_follow_room_metadata(
+// 关注与播放共用官方别名解析和同一次 profileRoom 请求；不改变关注身份键。
+async fn fetch_room_profile_at(
     client: &reqwest::Client,
     room_id: &str,
-) -> Result<HuyaUnifiedResponse, String> {
-    static ALIAS_ROOMS: std::sync::OnceLock<std::sync::Mutex<HashMap<String, String>>> = std::sync::OnceLock::new();
+    mobile_base: &str,
+    profile_api: &str,
+) -> Result<(String, Value), String> {
+    type AliasKey = (String, String, String);
+    static ALIAS_ROOMS: std::sync::OnceLock<std::sync::Mutex<HashMap<AliasKey, String>>> = std::sync::OnceLock::new();
+    let room_id = room_id.trim();
+    if room_id.is_empty() { return Err("虎牙房间号不能为空".to_string()); }
     let aliases = ALIAS_ROOMS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
-    let cached = aliases.lock().map_err(|e| e.to_string())?.get(room_id).cloned();
+    let key = (mobile_base.to_string(), profile_api.to_string(), room_id.to_string());
+    let cached = aliases.lock().map_err(|e| e.to_string())?.get(&key).cloned();
     let is_alias = !room_id.bytes().all(|b| b.is_ascii_digit());
     let canonical_id = if let Some(id) = cached {
         id
     } else if is_alias {
-        let page = client.get(format!("https://m.huya.com/{}", room_id))
+        let page = client.get(format!("{}/{}", mobile_base.trim_end_matches('/'), url_encode_component(room_id)))
             .header(USER_AGENT, DESKTOP_UA).send().await.map_err(|e| e.to_string())?
             .error_for_status().map_err(|e| e.to_string())?
             .text().await.map_err(|e| e.to_string())?;
@@ -1103,20 +1101,38 @@ async fn fetch_follow_room_metadata(
     } else {
         room_id.to_string()
     };
-    // 不走播放专用 fetch_profile_room 的流字段校验；关注允许 REPLAY 无 stream。
-    let profile: Value = client.get(format!(
-        "https://mp.huya.com/cache.php?m=Live&do=profileRoom&roomid={}&showSecret=1", canonical_id))
+    let profile: Value = client.get(profile_api)
+        .query(&[("m", "Live"), ("do", "profileRoom"), ("roomid", canonical_id.as_str()), ("showSecret", "1")])
         .header(ACCEPT, "*/*").header(ORIGIN, "https://www.huya.com")
         .header(REFERER, "https://www.huya.com/").header(USER_AGENT, DESKTOP_UA)
         .send().await.map_err(|e| e.to_string())?
         .error_for_status().map_err(|e| e.to_string())?
         .json().await.map_err(|e| e.to_string())?;
-    let mut metadata = extract_room_metadata(&profile)?;
-    metadata.profileRoom = Some(canonical_id.clone());
+    // REPLAY 可用于关注元数据，但是否允许播放仍由原播放校验决定。
+    // 只缓存完整、有效查询的成功映射；页面或接口失败允许下次重试。
+    extract_room_metadata(&profile)?;
     if is_alias {
-        // 仅完成有效房间查询后缓存成功映射，失败可于下次重试。
-        aliases.lock().map_err(|e| e.to_string())?.insert(room_id.to_string(), canonical_id);
+        aliases.lock().map_err(|e| e.to_string())?.insert(key, canonical_id.clone());
     }
+    Ok((canonical_id, profile))
+}
+
+async fn fetch_follow_room_metadata(
+    client: &reqwest::Client,
+    room_id: &str,
+) -> Result<HuyaUnifiedResponse, String> {
+    fetch_follow_room_metadata_at(client, room_id, "https://m.huya.com", "https://mp.huya.com/cache.php").await
+}
+
+async fn fetch_follow_room_metadata_at(
+    client: &reqwest::Client,
+    room_id: &str,
+    mobile_base: &str,
+    profile_api: &str,
+) -> Result<HuyaUnifiedResponse, String> {
+    let (canonical_id, profile) = fetch_room_profile_at(client, room_id, mobile_base, profile_api).await?;
+    let mut metadata = extract_room_metadata(&profile)?;
+    metadata.profileRoom = Some(canonical_id);
     Ok(metadata)
 }
 
@@ -1218,6 +1234,142 @@ const HEARTBEAT_BASE64: &str = "ABQdAAwsNgBM"; // same as Python
 #[cfg(test)]
 mod tests {
     use super::*;
+
+
+    fn alias_test_profile(status: &str) -> Value {
+        serde_json::json!({"status":200,"data":{"liveStatus":status,
+            "profileInfo":{"nick":"楚河"},"liveData":{"gameFullName":"主机游戏"},
+            "stream":{"baseSteamInfoList":[{"sCdnType":"TX","sFlvUrl":"http://tx.flv.huya.com/src",
+            "sStreamName":"stream","lChannelId":12345,"sFlvAntiCode":"wsSecret=valid&wsTime=abcdef"}]}}})
+    }
+
+    const ALIAS_TEST_PAGE: &str = r#"<script>var TT_ROOM_DATA={"profileRoom":998};</script>"#;
+
+    async fn alias_test_server() -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        alias_test_server_with_responses(vec![ALIAS_TEST_PAGE.to_string()], vec![alias_test_profile("ON")]).await
+    }
+
+    async fn alias_test_server_with_responses(pages: Vec<String>, profiles: Vec<Value>) -> (String, std::sync::Arc<std::sync::Mutex<Vec<String>>>, tokio::task::JoinHandle<()>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let server = tokio::spawn(async move {
+            let (mut page_index, mut profile_index) = (0, 0);
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else { break; };
+                let mut buf = vec![0; 8192];
+                let n = socket.read(&mut buf).await.unwrap();
+                let request = String::from_utf8_lossy(&buf[..n]).to_string();
+                let path = request.lines().next().unwrap().split_whitespace().nth(1).unwrap().to_string();
+                recorded.lock().unwrap().push(path.clone());
+                let body = if path == "/chuhe" {
+                    let value = pages[page_index.min(pages.len()-1)].clone();
+                    page_index += 1;
+                    value
+                } else if path.contains("roomid=998&") {
+                    let value = profiles[profile_index.min(profiles.len()-1)].to_string();
+                    profile_index += 1;
+                    value
+                } else { serde_json::json!({"status":422,"data":null}).to_string() };
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",body.len(),body);
+                socket.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+        (base, requests, server)
+    }
+
+    #[tokio::test]
+    async fn alias_playback_resolves_official_room_before_profile_request() {
+        let (base, requests, server) = alias_test_server().await;
+        let client = reqwest::Client::builder().no_proxy().timeout(Duration::from_secs(2)).build().unwrap();
+        let result = fetch_profile_room_at(&client, "chuhe", &base, &format!("{base}/profile")).await;
+        server.abort();
+        let profile = result.expect("on-air alias must resolve before calling the numeric-only profile API");
+        assert_eq!(extract_room_detail(&profile).nick.as_deref(), Some("楚河"));
+        assert_eq!(extract_stream_candidates(&profile).unwrap().len(), 1);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 2, "only one official alias page and one shared profile request");
+        assert_eq!(requests[0], "/chuhe");
+        assert!(requests[1].contains("roomid=998&"));
+    }
+
+    #[tokio::test]
+    async fn alias_playback_and_follow_share_successful_mapping_without_extra_profile_queries() {
+        for follow_first in [true, false] {
+            let (base, requests, server) = alias_test_server().await;
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let api = format!("{base}/profile");
+            for follow in [follow_first, !follow_first] {
+                if follow {
+                    let data = fetch_follow_room_metadata_at(&client,"chuhe",&base,&api).await.unwrap();
+                    assert_eq!(data.profileRoom.as_deref(),Some("998"));
+                    assert_eq!(data.category_name.as_deref(),Some("主机游戏"));
+                    assert!(data.candidate_urls.is_empty());
+                } else {
+                    let profile=fetch_profile_room_at(&client,"chuhe",&base,&api).await.unwrap();
+                    assert_eq!(extract_stream_candidates(&profile).unwrap().len(),1);
+                }
+            }
+            server.abort();
+            let requests=requests.lock().unwrap();
+            assert_eq!(requests.len(),3);
+            assert_eq!(requests.iter().filter(|p|*p=="/chuhe").count(),1);
+            assert_eq!(requests.iter().filter(|p|p.contains("roomid=998&")).count(),2);
+        }
+    }
+
+    #[tokio::test]
+    async fn alias_failed_page_or_profile_is_not_permanently_cached() {
+        for invalid_page in [true,false] {
+            let pages=if invalid_page {vec!["<h1>主播998</h1>".into(),ALIAS_TEST_PAGE.into()]} else {vec![ALIAS_TEST_PAGE.into()]};
+            let profiles=if invalid_page {vec![alias_test_profile("ON")]} else {vec![serde_json::json!({"status":422}),alias_test_profile("ON")]};
+            let (base,requests,server)=alias_test_server_with_responses(pages,profiles).await;
+            let client=reqwest::Client::builder().no_proxy().build().unwrap();
+            let api=format!("{base}/profile");
+            assert!(fetch_profile_room_at(&client,"chuhe",&base,&api).await.is_err());
+            let profile=fetch_profile_room_at(&client,"chuhe",&base,&api).await.unwrap();
+            assert!(extract_room_detail(&profile).status);
+            server.abort();
+            let requests=requests.lock().unwrap();
+            assert_eq!(requests.iter().filter(|p|*p=="/chuhe").count(),2);
+        }
+    }
+
+    #[tokio::test]
+    async fn numeric_playback_skips_alias_page_and_offline_is_preserved() {
+        let (base,requests,server)=alias_test_server_with_responses(vec![ALIAS_TEST_PAGE.into()],vec![alias_test_profile("OFF")]).await;
+        let client=reqwest::Client::builder().no_proxy().build().unwrap();
+        let profile=fetch_profile_room_at(&client," 998 ",&base,&format!("{base}/profile")).await.unwrap();
+        assert!(!extract_room_detail(&profile).status);
+        assert!(extract_stream_candidates(&profile).unwrap().is_empty());
+        server.abort();
+        assert_eq!(requests.lock().unwrap().len(),1);
+    }
+
+    #[tokio::test]
+    async fn alias_replay_retains_follow_category_without_bypassing_playback_validation() {
+        let mut profile=alias_test_profile("REPLAY");
+        profile["data"].as_object_mut().unwrap().remove("stream");
+        let (base,_,server)=alias_test_server_with_responses(vec![ALIAS_TEST_PAGE.into()],vec![profile]).await;
+        let client=reqwest::Client::builder().no_proxy().build().unwrap();
+        let api=format!("{base}/profile");
+        let metadata=fetch_follow_room_metadata_at(&client,"chuhe",&base,&api).await.unwrap();
+        assert!(!metadata.is_live);
+        assert_eq!(metadata.category_name.as_deref(),Some("主机游戏"));
+        assert!(fetch_profile_room_at(&client,"chuhe",&base,&api).await.is_err());
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_alias_is_rejected_without_network_request() {
+        let (base,requests,server)=alias_test_server().await;
+        let client=reqwest::Client::builder().no_proxy().build().unwrap();
+        assert!(fetch_profile_room_at(&client," ",&base,&format!("{base}/profile")).await.is_err());
+        server.abort();
+        assert!(requests.lock().unwrap().is_empty());
+    }
 
     #[test]
     fn room_metadata_does_not_require_playback_authentication() {

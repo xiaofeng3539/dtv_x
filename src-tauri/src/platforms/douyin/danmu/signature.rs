@@ -80,6 +80,11 @@ pub async fn generate_signature(
             e
         })?;
 
+    runtime.execute_script("[platform-user-agent]", FastString::from(format!(
+        "globalThis.__dtv_douyin_user_agent = {};",
+        serde_json::to_string(crate::platforms::douyin::web_api::DEFAULT_USER_AGENT)?,
+    )))?;
+
     // Use the embedded sign.js content
     runtime
         .execute_script("./sign.js", FastString::from_static(SIGN_JS_CONTENT))
@@ -88,29 +93,18 @@ pub async fn generate_signature(
             e
         })?;
 
-    let call_script = format!("get_sign('{}')", md5_param);
-    // For dynamic strings, convert to String first, then into FastString
-    let fast_call_script = FastString::from(call_script);
-    let result = runtime
-        .execute_script("[call_get_sign]", fast_call_script)
-        .map_err(|e| {
-            error!("[Douyin Danmaku] Error during deno_core call to get_sign: {}", e);
-            e
-        })?;
-
-    deno_core::scope!(scope, runtime);
-    let local_value = deno_core::v8::Local::new(scope, result);
-
-    if local_value.is_string() {
-        let signature = local_value.to_rust_string_lossy(scope);
-        debug!("[Douyin Danmaku] Final signature computed.");
-        Ok(signature)
-    } else {
-        Err(
-            Box::from("get_sign did not return a string value from deno_core")
-                as Box<dyn std::error::Error + Send + Sync>,
-        )
+    // Simple Live regenerates signatures containing '-' or '='. Keep this bounded.
+    for _ in 0..128 {
+        let result = runtime.execute_script("[call_get_sign]", FastString::from(format!("get_sign('{}')", md5_param)))?;
+        let signature = {
+            deno_core::scope!(scope, runtime);
+            let value = deno_core::v8::Local::new(scope, result);
+            if !value.is_string() { return Err("get_sign did not return a string".into()); }
+            value.to_rust_string_lossy(scope)
+        };
+        if !signature.is_empty() && !signature.contains(['-', '=']) { return Ok(signature); }
     }
+    Err("Douyin signature generation exhausted its retry limit".into())
 }
 
 pub fn generate_ms_token(length: usize) -> String {

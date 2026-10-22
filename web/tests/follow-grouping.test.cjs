@@ -74,11 +74,12 @@ test('刷新接收有效分类（含未开播）、失败保留分类缓存且�
 test('旧关注兼容且序列化剔除运行时热度但不丢分类、身份或其他字段', () => {
   assert.equal(typeof stripFollowRuntime, 'function');
   const old = { platform: 'HUYA', id: '1', liveStatus: 'UNKNOWN' };
-  assert.deepEqual(plain(stripFollowRuntime(old)), old);
+  assert.deepEqual(plain(stripFollowRuntime(old)), { platform: 'HUYA', id: '1' });
   const item = streamer('HUYA', '1', '英雄联盟', 'LIVE', 99);
   item.categoryId = '1';
   const saved = plain(stripFollowRuntime(item));
   assert.equal(Object.hasOwn(saved, 'popularity'), false);
+  assert.equal(Object.hasOwn(saved, 'liveStatus'), false);
   assert.equal(saved.categoryName, '英雄联盟');
   assert.equal(saved.categoryId, '1');
   assert.equal(item.popularity, 99);

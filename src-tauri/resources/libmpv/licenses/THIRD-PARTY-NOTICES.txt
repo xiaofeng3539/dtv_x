@@ -14,6 +14,6 @@ The DLL remains a replaceable dynamic library; no external player process is req
 
 Simple Live playback/configuration and platform selection algorithms were used as a read-only porting reference:
 https://github.com/xiaoyaocz/dart_simple_live
-Reference source files: simple_live_core/lib/src/{bilibili_site,douyu_site,huya_site,douyin_site}.dart; simple_live_app/lib/modules/live_room/{live_room_controller.dart,player/player_controller.dart}.
+Reference source files: simple_live_core/lib/src/{bilibili_site,douyu_site,huya_site,douyin_site}.dart; simple_live_core/lib/src/danmaku/douyin_danmaku.dart; simple_live_core/lib/src/scripts/douyin_sign.dart; simple_live_app/lib/modules/live_room/{live_room_controller.dart,player/player_controller.dart}.
 Simple Live license: GPL-3.0; included separately. No Dart runtime or Flutter UI is bundled; DTV's React UI is retained.
 DTV's existing LICENSE and attribution are unchanged.

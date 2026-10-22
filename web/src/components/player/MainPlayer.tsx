@@ -94,6 +94,10 @@ const STALL_STUCK_MS = 30000;
 // 20s 而非 45s：正常重建（停弹幕→停代理→取流→mount）只要几秒，
 // 45s 的观感就是「转圈转到天荒地老」，用户根本等不到看门狗来救就已经去手动刷新了。
 const RELOAD_HARD_TIMEOUT_MS = 20000;
+// Native metadata may use the platform's 20-second request and HTML/session fallback,
+// then retry the room query once. Do not cancel it using the old MSE deadline.
+const NATIVE_RELOAD_HARD_TIMEOUT_MS = 90000;
+const reloadTimeoutMs = () => usesNativePlayback() ? NATIVE_RELOAD_HARD_TIMEOUT_MS : RELOAD_HARD_TIMEOUT_MS;
 
 // 单个 Rust invoke 的兜底超时：绝不能让一个永不返回的 invoke 把整条重连链钉死。
 // 停止类命令是幂等的，超时后继续往下走是安全的（下次重连会再停一次）。
@@ -107,13 +111,13 @@ const INVOKE_TIMEOUT_MS = 4000;
  * —— 用户看到的就是「一直黑屏转圈，手动点刷新才好」。
  * 注意：这里只让 await 不再阻塞，不取消底层调用；停止类命令幂等，重复执行无害。
  */
-const invokeWithTimeout = async <T,>(promise: Promise<T>, label: string): Promise<T> => {
+const invokeWithTimeout = async <T,>(promise: Promise<T>, label: string, timeoutMs = INVOKE_TIMEOUT_MS): Promise<T> => {
   let timer: number | undefined;
   try {
     return await Promise.race([
       promise,
       new Promise<never>((_, reject) => {
-        timer = window.setTimeout(() => reject(new Error(`${label} 超时`)), INVOKE_TIMEOUT_MS);
+        timer = window.setTimeout(() => reject(new Error(`${label} 超时`)), timeoutMs);
       })
     ]);
   } finally {
@@ -316,6 +320,7 @@ export function MainPlayer({
   //   每次都进回调才被 isSessionActive 挡掉，白耗 IPC 反序列化与回调开销，
   //   并且它持有的 overlay 引用会阻止旧弹幕实例被回收。
   const unlistenRef = useRef<Set<() => void>>(new Set());
+  const danmakuCleanupRef = useRef<Promise<unknown>>(Promise.resolve());
 
   /** 解绑并清空所有弹幕事件监听器。 */
   const clearDanmakuListeners = useCallback(() => {
@@ -780,7 +785,7 @@ export function MainPlayer({
     // ★ 但这里必须**暂存**而不是直接丢弃：若窗口期内真的断了一次流，
     //   直接 return 就再也没人会发起这次重连了（内核 error 被吞、看门狗又在窗口内躺平），
     //   结果是永久黑屏、只能手动刷新。暂存后由看门狗在窗口到期时捡起来补排。
-    if (Date.now() < reconnectCooldownUntilRef.current && playerRef.current?.video?.dataset?.nativePlayback !== "true") {
+    if (Date.now() < reconnectCooldownUntilRef.current && !usesNativePlayback()) {
       reconnectDeferredRef.current = true;
       return;
     }
@@ -795,6 +800,8 @@ export function MainPlayer({
       return;
     }
 
+    const nativeRecovery = usesNativePlayback();
+    const maxAttempts = nativeRecovery ? streamCandidateCountRef.current + 1 : RECONNECT_MAX_ATTEMPTS;
     const attempt = reconnectAttemptRef.current;
     const now = Date.now();
 
@@ -817,7 +824,7 @@ export function MainPlayer({
       return;
     }
 
-    if (attempt >= RECONNECT_MAX_ATTEMPTS) {
+    if (attempt >= maxAttempts) {
       // 次数用尽：停止自动重连，给出明确出口（错误页 + 「再试一次」按钮）。
       // 必须置 gaveUp 标志并把计数归零，否则看门狗会把「已达上限」也当成
       // 「重连链条停滞」而反复补调度，陷入无意义的重试循环。
@@ -827,7 +834,7 @@ export function MainPlayer({
       reconnectDeferredRef.current = false;
       setReconnectNotice(null);
       setStreamError(
-        `网络连接中断，已自动重连 ${RECONNECT_MAX_ATTEMPTS} 次仍未成功。\n请检查网络连接后点击「再试一次」。`
+        `网络连接中断，已自动重连 ${maxAttempts} 次仍未成功。\n请检查网络连接后点击「再试一次」。`
       );
       return;
     }
@@ -837,18 +844,18 @@ export function MainPlayer({
 
     reconnectAttemptRef.current = attempt + 1;
     const seq = attempt + 1;
-    const delay = playerRef.current?.video?.dataset?.nativePlayback === "true" && attempt === 0 ? 0 : RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)];
-    console.info(`[Player] 连接中断（${reason}），${delay}ms 后进行第 ${seq}/${RECONNECT_MAX_ATTEMPTS} 次自动重连`);
+    const delay = nativeRecovery ? 0 : RECONNECT_DELAYS_MS[Math.min(attempt, RECONNECT_DELAYS_MS.length - 1)];
+    console.info(`[Player] 连接中断（${reason}），${delay}ms 后进行第 ${seq}/${maxAttempts} 次自动重连`);
     setReconnectNotice(
       delay >= 1000
-        ? `连接中断，${Math.round(delay / 1000)} 秒后自动重连（第 ${seq}/${RECONNECT_MAX_ATTEMPTS} 次）…`
-        : `连接中断，正在自动重连（第 ${seq}/${RECONNECT_MAX_ATTEMPTS} 次）…`
+        ? `连接中断，${Math.round(delay / 1000)} 秒后自动重连（第 ${seq}/${maxAttempts} 次）…`
+        : `连接中断，正在自动重连（第 ${seq}/${maxAttempts} 次）…`
     );
 
     reconnectTimerRef.current = window.setTimeout(() => {
       reconnectTimerRef.current = null;
       if (disposedRef.current) return;
-      setReconnectNotice(`正在重连（第 ${seq}/${RECONNECT_MAX_ATTEMPTS} 次）…`);
+      setReconnectNotice(`正在重连（第 ${seq}/${maxAttempts} 次）…`);
       void reloadStreamRef.current?.("refresh", undefined, { isAutoReconnect: true });
     }, delay);
   }, []);
@@ -956,7 +963,7 @@ export function MainPlayer({
         // 取流 / 重建挂死：超过硬超时一律判定为死锁，作废该会话并重排重连。
         // 没有这一步，一个永不返回的 await 就能把 reloadInFlightRef 永久钉在 true，
         // 之后所有重连请求都被守卫吞掉 —— 那正是用户看到的「一直转圈」。
-        if (reloadInFlightRef.current && now - reloadStartedAtRef.current > RELOAD_HARD_TIMEOUT_MS) {
+        if (reloadInFlightRef.current && now - reloadStartedAtRef.current > reloadTimeoutMs()) {
           console.warn("[Player] 取流/重建超过硬超时，判定为挂死：作废该会话并重排重连");
           reloadInFlightRef.current = false;
           pendingReloadRef.current = null;
@@ -1357,6 +1364,8 @@ export function MainPlayer({
       roomIdToFilter?: string
     ) => {
       if (!roomIdToStart || !isSessionActive(sessionId)) return;
+      await danmakuCleanupRef.current;
+      if (!isSessionActive(sessionId)) return;
       clearDanmakuListeners();
 
        try {
@@ -1372,7 +1381,7 @@ export function MainPlayer({
            await invoke("start_danmaku_listener", { roomId: roomIdToStart });
          } else if (platformToStart === Platform.DOUYIN) {
            const payload: RustGetStreamUrlPayload = { args: { room_id_str: roomIdToStart }, platform: Platform.DOUYIN };
-           await invoke("start_douyin_danmu_listener", { payload });
+           await invoke("start_douyin_danmu_listener", { payload, resolvedRoomId: roomIdToFilter || null });
          } else if (platformToStart === Platform.HUYA) {
            await invoke("start_huya_danmaku_listener", { payload: { args: { room_id_str: roomIdToStart } } });
         } else if (platformToStart === Platform.BILIBILI) {
@@ -1476,17 +1485,18 @@ export function MainPlayer({
 
       const isHlsPlayback = (streamType || "").toLowerCase() === "hls" || url.toLowerCase().includes(".m3u8");
 
+      const nativeKernel = usesNativePlayback();
       const [{ default: PlayerCtor }, flvMod, hlsMod, overlayMod, pluginsMod] = await Promise.all([
         import("xgplayer"),
-        import("xgplayer-flv"),
-        import("xgplayer-hls.js"),
+        nativeKernel ? Promise.resolve(null) : import("xgplayer-flv"),
+        nativeKernel ? Promise.resolve(null) : import("xgplayer-hls.js"),
         import("@/components/player/danmuOverlay"),
         import("@/components/player/plugins")
       ]);
 
       if (!isSessionActive(sessionId)) return;
-      const FlvPlugin: any = (flvMod as any).default ?? flvMod;
-      const HlsPlugin: any = (hlsMod as any).default ?? hlsMod;
+      const FlvPlugin: any = flvMod ? (flvMod as any).default ?? flvMod : null;
+      const HlsPlugin: any = hlsMod ? (hlsMod as any).default ?? hlsMod : null;
       const { applyDanmuOverlayPreferences, createDanmuOverlay, syncDanmuEnabledState } = overlayMod as any;
       const { DanmuKeywordBlockControl, DanmuSettingsControl, DanmuToggleControl, LineControl, QualityControl, RefreshControl, VolumeControl } =
         pluginsMod as any;
@@ -1529,7 +1539,7 @@ export function MainPlayer({
         }
       };
 
-      const nativePlayback = usesNativePlayback() ? await createNativePlayback(platform) : null;
+      const nativePlayback = nativeKernel ? await createNativePlayback(platform) : null;
       if (nativePlayback && !isSessionActive(sessionId)) { await nativePlayback.dispose(); return; }
       if (!nativePlayback) {
       if (isHlsPlayback) {
@@ -1879,7 +1889,7 @@ export function MainPlayer({
         // 上一次取流是否已经明显挂死（远超正常耗时却仍未收尾）
         const hung =
           reloadStartedAtRef.current > 0 &&
-          Date.now() - reloadStartedAtRef.current > RELOAD_HARD_TIMEOUT_MS;
+          Date.now() - reloadStartedAtRef.current > reloadTimeoutMs();
 
         if (opts?.isAutoReconnect) {
           if (hung) {
@@ -1934,7 +1944,9 @@ export function MainPlayer({
         setReconnectNotice(null);
       } else {
         // 刷新凭据后尝试下一条同画质线路，不持续重试失效的 CDN。
-        streamCandidateIndexRef.current = (streamCandidateIndexRef.current + 1) % streamCandidateCountRef.current;
+        streamCandidateIndexRef.current = usesNativePlayback()
+          ? Math.min(streamCandidateIndexRef.current + 1, streamCandidateCountRef.current - 1)
+          : (streamCandidateIndexRef.current + 1) % streamCandidateCountRef.current;
       }
 
       setIsLoadingStream(true);
@@ -1964,7 +1976,7 @@ export function MainPlayer({
         //   只有连续失败（第 2 次起）才升级为彻底重建，用它兜住另一种情况：
         //   重取到的流地址与旧地址字符串完全相同，内核会把 switchURL 当成空操作
         //   （既不报错也不播放），这时必须重建才行。
-        if (reconnectAttemptRef.current >= 2) {
+        if (reconnectAttemptRef.current >= 2 && !usesNativePlayback()) {
           destroyPlayer();
         }
       }
@@ -1985,16 +1997,19 @@ export function MainPlayer({
       // 位于 try **之外**，一旦命中就会跳过 finally：reloadInFlightRef 被永久钉在 true、
       // loading 永久为真，之后每一次重连都被守卫吞掉，画面就一直转圈直到手动刷新。
       try {
-        await stopAllDanmakuBackends();
-        if (!isSessionActive(sessionId)) return;
-        await stopAllProxies();
-        if (!isSessionActive(sessionId)) return;
-
-        try {
-          await applyDanmuFontFamilyForOS();
-        } catch {
-          // ignore
+        // Match Simple Live: video loading is independent of the old danmaku connection.
+        // The next danmaku start still waits for every prior stop, so it cannot be stopped late.
+        const stoppingDanmaku = stopAllDanmakuBackends();
+        danmakuCleanupRef.current = Promise.all([danmakuCleanupRef.current, stoppingDanmaku]).then(() => {}, () => {});
+        if (!usesNativePlayback()) {
+          await stoppingDanmaku;
+          if (!isSessionActive(sessionId)) return;
+          await stopAllProxies();
+        } else {
+          void stopAllProxies().catch(() => {});
         }
+        if (!isSessionActive(sessionId)) return;
+        void applyDanmuFontFamilyForOS().catch(() => {});
 
         if (platform === Platform.DOUYU) {
           const resolvedLine = resolveCurrentLineFor(lineOptions, effectiveLine);
@@ -2004,9 +2019,9 @@ export function MainPlayer({
             setPlayerAnchorName(info?.nickname ?? null);
             setPlayerAvatar(info?.avatar_url ?? null);
           }).catch(() => {});
-          const { streamUrl, streamType } = await getDouyuStreamConfig(
+          const { streamUrl, streamType } = await invokeWithTimeout(getDouyuStreamConfig(
             roomId, effectiveQuality, resolvedLine, opts?.isAutoReconnect ? reconnectAttemptRef.current : 0
-          );
+          ), "获取斗鱼直播信息", reloadTimeoutMs());
           if (!isSessionActive(sessionId)) return;
           setPlayerIsLive(true);
           const nextIsHls = (streamType || "").toLowerCase() === "hls" || streamUrl.toLowerCase().includes(".m3u8");
@@ -2017,10 +2032,10 @@ export function MainPlayer({
             !!danmuOverlayRef.current &&
             typeof player.switchURL === "function" &&
             !!playbackKindRef.current &&
-            playbackKindRef.current === nextKind;
+            (playbackKindRef.current === nextKind || player.video?.dataset?.nativePlayback === "true");
           if (canSoftSwitch) {
             try {
-              const ret = player.switchURL(streamUrl, { seamless: false });
+              const ret = player.switchURL(streamUrl, { seamless: false, platform });
               if (ret && typeof (ret as any).then === "function") await ret;
               if (isSessionActive(sessionId)) {
                 playbackKindRef.current = nextKind;
@@ -2036,7 +2051,7 @@ export function MainPlayer({
             await mountPlayer(sessionId, streamUrl, streamType);
           }
         } else if (platform === Platform.DOUYIN) {
-          const resp = await fetchAndPrepareDouyinStreamConfig(roomId, effectiveQuality, streamCandidateIndexRef.current);
+          const resp = await invokeWithTimeout(fetchAndPrepareDouyinStreamConfig(roomId, effectiveQuality, streamCandidateIndexRef.current), "获取抖音直播信息", reloadTimeoutMs());
           if (!isSessionActive(sessionId)) return;
           streamCandidateCountRef.current = resp.candidateCount || 1;
           setPlayerTitle(resp.title ?? null);
@@ -2055,10 +2070,10 @@ export function MainPlayer({
             !!danmuOverlayRef.current &&
             typeof player.switchURL === "function" &&
             !!playbackKindRef.current &&
-            playbackKindRef.current === nextKind;
+            (playbackKindRef.current === nextKind || player.video?.dataset?.nativePlayback === "true");
           if (canSoftSwitch) {
             try {
-              const ret = player.switchURL(resp.streamUrl, { seamless: false });
+              const ret = player.switchURL(resp.streamUrl, { seamless: false, platform });
               if (ret && typeof (ret as any).then === "function") await ret;
               if (isSessionActive(sessionId)) {
                 playbackKindRef.current = nextKind;
@@ -2075,12 +2090,12 @@ export function MainPlayer({
           }
         } else if (platform === Platform.HUYA) {
           const resolvedLine = resolveCurrentLineFor(lineOptions, effectiveLine);
-          const { streamUrl, streamType, title, anchorName, avatar, isLive, candidateCount } = await getHuyaStreamConfig(
+          const { streamUrl, streamType, title, anchorName, avatar, isLive, candidateCount } = await invokeWithTimeout(getHuyaStreamConfig(
             roomId,
             effectiveQuality,
             resolvedLine,
             streamCandidateIndexRef.current
-          );
+          ), "获取虎牙直播信息", reloadTimeoutMs());
           if (!isSessionActive(sessionId)) return;
           streamCandidateCountRef.current = candidateCount;
           setPlayerTitle(title ?? null);
@@ -2095,10 +2110,10 @@ export function MainPlayer({
             !!danmuOverlayRef.current &&
             typeof player.switchURL === "function" &&
             !!playbackKindRef.current &&
-            playbackKindRef.current === nextKind;
+            (playbackKindRef.current === nextKind || player.video?.dataset?.nativePlayback === "true");
           if (canSoftSwitch) {
             try {
-              const ret = player.switchURL(streamUrl, { seamless: false });
+              const ret = player.switchURL(streamUrl, { seamless: false, platform });
               if (ret && typeof (ret as any).then === "function") await ret;
               if (isSessionActive(sessionId)) {
                 playbackKindRef.current = nextKind;
@@ -2122,7 +2137,7 @@ export function MainPlayer({
             setPlayerAnchorName(info?.anchor_name ?? null);
             setPlayerAvatar(info?.avatar ?? null);
           }).catch(() => {});
-          const { streamUrl, streamType, candidateCount } = await getBilibiliStreamConfig(roomId, effectiveQuality, cookie || undefined, streamCandidateIndexRef.current);
+          const { streamUrl, streamType, candidateCount } = await invokeWithTimeout(getBilibiliStreamConfig(roomId, effectiveQuality, cookie || undefined, streamCandidateIndexRef.current), "获取哔哩哔哩直播信息", reloadTimeoutMs());
           if (!isSessionActive(sessionId)) return;
           streamCandidateCountRef.current = candidateCount;
           setPlayerIsLive(true);
@@ -2134,10 +2149,10 @@ export function MainPlayer({
             !!danmuOverlayRef.current &&
             typeof player.switchURL === "function" &&
             !!playbackKindRef.current &&
-            playbackKindRef.current === nextKind;
+            (playbackKindRef.current === nextKind || player.video?.dataset?.nativePlayback === "true");
           if (canSoftSwitch) {
             try {
-              const ret = player.switchURL(streamUrl, { seamless: false });
+              const ret = player.switchURL(streamUrl, { seamless: false, platform });
               if (ret && typeof (ret as any).then === "function") await ret;
               if (isSessionActive(sessionId)) {
                 playbackKindRef.current = nextKind;
@@ -2154,7 +2169,7 @@ export function MainPlayer({
           }
         } else if (platform === Platform.TWITCH) {
           // Twitch：roomId 即频道 login；GQL 元数据 + usher m3u8 一次拿全
-          const cfg = await getTwitchStreamConfig(roomId, effectiveQuality);
+          const cfg = await invokeWithTimeout(getTwitchStreamConfig(roomId, effectiveQuality), "获取 Twitch 直播信息", reloadTimeoutMs());
           if (!isSessionActive(sessionId)) return;
           setPlayerTitle(cfg.title || null);
           setPlayerAnchorName(cfg.anchorName || null);
@@ -2170,10 +2185,10 @@ export function MainPlayer({
             !!danmuOverlayRef.current &&
             typeof player.switchURL === "function" &&
             !!playbackKindRef.current &&
-            playbackKindRef.current === nextKind;
+            (playbackKindRef.current === nextKind || player.video?.dataset?.nativePlayback === "true");
           if (canSoftSwitch) {
             try {
-              const ret = player.switchURL(cfg.streamUrl, { seamless: false });
+              const ret = player.switchURL(cfg.streamUrl, { seamless: false, platform });
               if (ret && typeof (ret as any).then === "function") await ret;
               if (isSessionActive(sessionId)) {
                 playbackKindRef.current = nextKind;
@@ -2221,12 +2236,12 @@ export function MainPlayer({
             reconnectDeferredRef.current = false;
             setReconnectNotice(null);
             setStreamError(
-              `暂时无法获取直播流（连续 ${fetchFailStreakRef.current} 次取流失败）。\n请检查网络连接后点击「再试一次」。`
+              `暂时无法获取直播流（连续 ${fetchFailStreakRef.current} 次取流失败）。\n${msg}\n点击「再试一次」重新加载。`
             );
             // return 不会跳过 finally，in-flight 锁仍会被正确释放
             return;
           }
-          setStreamError(null);
+          setStreamError(msg || "直播信息获取失败，正在准备重试。");
           setIsOfflineError(false);
           pendingReconnectReason = "取流失败";
         }
@@ -2482,7 +2497,9 @@ export function MainPlayer({
 
 
               {isLoadingStream ? (
-                <div className="loading-player" style={{ position: "absolute", inset: 0, zIndex: 20 }}>
+                <div className="loading-player" role="status" style={{ position: "absolute", inset: 0, zIndex: 20, gap: 12 }}>
+                  <span className="reconnect-spinner" aria-hidden="true" />
+                  <span>正在获取直播信息…</span>
                 </div>
               ) : null}
 
